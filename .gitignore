@@ -1,0 +1,7 @@
+@"
+WOS.env
+.env
+*.env
+__pycache__/
+*.pyc
+"@ | Set-Content ".gitignore"
