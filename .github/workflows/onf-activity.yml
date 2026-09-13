@@ -7,20 +7,34 @@ on:
     - cron: "0 */12 * * *"
 
 jobs:
-
   collect-onf-activity:
 
-    runs-on:
-      ubuntu-latest
+    runs-on: ubuntu-latest
 
     steps:
 
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Debug repository files
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Root files:"
+          ls -la
+
+          echo "All Python files:"
+          find . -type f -name "*.py" -print
+
+          echo "Git branch:"
+          git branch --show-current
+
+          echo "Git status:"
+          git status
+
       - name: Set up Python
         uses: actions/setup-python@v5
-
         with:
           python-version: "3.12"
 
@@ -34,6 +48,5 @@ jobs:
           WOSORACLE_API_TOKEN: ${{ secrets.WOSORACLE_API_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-
         run: |
-          python onf_collector.py
+          python ./onf_collector.py
