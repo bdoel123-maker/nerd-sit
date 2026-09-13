@@ -125,23 +125,25 @@ def format_furnace_level(level):
     except (TypeError, ValueError):
         return str(level)
 
-    mapping = {
-        35: "FC1",
-        40: "FC2",
-        45: "FC3",
-        50: "FC4",
-        55: "FC5",
-        60: "FC6",
-        65: "FC7",
-        70: "FC8",
-        75: "FC9",
-        80: "FC10"
-    }
+    thresholds = [
+        (80, "FC10"),
+        (75, "FC9"),
+        (70, "FC8"),
+        (65, "FC7"),
+        (60, "FC6"),
+        (55, "FC5"),
+        (50, "FC4"),
+        (45, "FC3"),
+        (40, "FC2"),
+        (35, "FC1")
+    ]
 
-    return mapping.get(
-        level,
-        str(level)
-    )
+    for minimum, label in thresholds:
+
+        if level >= minimum:
+            return label
+
+    return str(level)
 
 
 # ============================================================
