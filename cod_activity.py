@@ -71,22 +71,19 @@ if not SUPABASE_KEY:
 # ============================================================
 
 STATE_ID = 2348
-
 TARGET_ALLIANCE = "COD"
 
 MAX_RETRIES = 3
 
 PLAYER_BATCH_SIZE = 8
-
 PLAYER_BATCH_DELAY_SECONDS = 2
 
 SUPABASE_BATCH_SIZE = 50
-
 SUPABASE_TABLE = "cod_activity"
 
 
 # ============================================================
-# WOS ORACLE HEADERS
+# HEADERS
 # ============================================================
 
 WOS_HEADERS = {
@@ -94,10 +91,6 @@ WOS_HEADERS = {
     "Accept": "application/json"
 }
 
-
-# ============================================================
-# SUPABASE HEADERS
-# ============================================================
 
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -115,6 +108,40 @@ def utc_now():
     return datetime.now(
         timezone.utc
     ).isoformat()
+
+
+# ============================================================
+# FORMAT FURNACE LEVEL
+# ============================================================
+
+def format_furnace_level(level):
+
+    if level is None:
+        return None
+
+    try:
+        level = int(level)
+
+    except (TypeError, ValueError):
+        return str(level)
+
+    mapping = {
+        35: "FC1",
+        40: "FC2",
+        45: "FC3",
+        50: "FC4",
+        55: "FC5",
+        60: "FC6",
+        65: "FC7",
+        70: "FC8",
+        75: "FC9",
+        80: "FC10"
+    }
+
+    return mapping.get(
+        level,
+        str(level)
+    )
 
 
 # ============================================================
@@ -151,7 +178,6 @@ def oracle_get(
         f"https://wosoracle.com"
         f"{path}"
     )
-
 
     for attempt in range(
         1,
@@ -285,7 +311,7 @@ def oracle_get(
 
 
 # ============================================================
-# GET STATE
+# WOS ENDPOINT HELPERS
 # ============================================================
 
 def get_state(
@@ -298,10 +324,6 @@ def get_state(
     )
 
 
-# ============================================================
-# GET ALLIANCE
-# ============================================================
-
 def get_alliance(
     alliance_id
 ):
@@ -311,10 +333,6 @@ def get_alliance(
         f"{alliance_id}"
     )
 
-
-# ============================================================
-# GET PLAYER
-# ============================================================
 
 def get_player(
     fid
@@ -478,7 +496,7 @@ def discover_cod_players():
 
 
     # ========================================================
-    # LOAD FULL ALLIANCE
+    # LOAD FULL COD ALLIANCE
     # ========================================================
 
     alliance = get_alliance(
@@ -600,7 +618,7 @@ def discover_cod_players():
 
 
 # ============================================================
-# FETCH FULL PLAYER PROFILES
+# FETCH FULL COD PLAYER PROFILES
 # ============================================================
 
 def fetch_full_player_profiles(
@@ -623,11 +641,8 @@ def fetch_full_player_profiles(
 
 
     full_profiles = []
-
     failed_profiles = []
-
     skipped_profiles = []
-
 
     total_players = len(
         players
@@ -671,10 +686,6 @@ def fetch_full_player_profiles(
         )
 
 
-        # ====================================================
-        # FETCH INDIVIDUAL PLAYERS
-        # ====================================================
-
         for base_player in batch:
 
             fid = (
@@ -688,6 +699,10 @@ def fetch_full_player_profiles(
                 fid
             )
 
+
+            # =================================================
+            # FAILED PROFILE
+            # =================================================
 
             if not player:
 
@@ -855,12 +870,18 @@ def fetch_full_player_profiles(
                 "| Power:",
                 f'{full_profile["power"]:,}',
                 "| Kills:",
-                f'{full_profile["kills"]:,}'
+                f'{full_profile["kills"]:,}',
+                "| Furnace:",
+                format_furnace_level(
+                    full_profile[
+                        "furnace_level"
+                    ]
+                )
             )
 
 
         # ====================================================
-        # WAIT BETWEEN BATCHES
+        # DELAY BETWEEN BATCHES
         # ====================================================
 
         if batch_end < total_players:
@@ -921,7 +942,7 @@ def fetch_full_player_profiles(
 
 
 # ============================================================
-# WRITE COD ACTIVITY SNAPSHOT
+# WRITE COD ACTIVITY SNAPSHOT TO SUPABASE
 # ============================================================
 
 def write_cod_activity(
@@ -954,12 +975,11 @@ def write_cod_activity(
 
     captured_at = utc_now()
 
-
     rows = []
 
 
     # ========================================================
-    # BUILD DATABASE ROWS
+    # BUILD SUPABASE ROWS
     # ========================================================
 
     for player in profiles:
@@ -985,16 +1005,10 @@ def write_cod_activity(
                 STATE_ID,
 
             "furnace_level":
-                (
-                    str(
-                        player[
-                            "furnace_level"
-                        ]
-                    )
-                    if player.get(
+                format_furnace_level(
+                    player.get(
                         "furnace_level"
-                    ) is not None
-                    else None
+                    )
                 ),
 
             "total_power":
@@ -1059,12 +1073,11 @@ def write_cod_activity(
 
 
     success_count = 0
-
     failed_count = 0
 
 
     # ========================================================
-    # WRITE BATCHES
+    # WRITE IN BATCHES
     # ========================================================
 
     for batch_number, batch in enumerate(
@@ -1280,6 +1293,7 @@ def verify_cod_activity():
                 "id,"
                 "fid,"
                 "player_name,"
+                "furnace_level,"
                 "total_power,"
                 "kills,"
                 "captured_at"
@@ -1302,7 +1316,6 @@ def verify_cod_activity():
             params=params,
             timeout=30
         )
-
 
     except requests.RequestException as error:
 
@@ -1418,6 +1431,10 @@ def verify_cod_activity():
             row.get(
                 "fid"
             ),
+            "| Furnace:",
+            row.get(
+                "furnace_level"
+            ),
             "| Power:",
             f"{power:,}",
             "| Kills:",
@@ -1481,7 +1498,7 @@ def display_profiles(
     ):
 
         print(
-            f"{position:>3}. ",
+            f"{position:>3}.",
             player[
                 "name"
             ],
@@ -1489,14 +1506,16 @@ def display_profiles(
             player[
                 "fid"
             ],
+            "| Furnace:",
+            format_furnace_level(
+                player.get(
+                    "furnace_level"
+                )
+            ),
             "| Power:",
             f'{player["power"]:,}',
             "| Kills:",
-            f'{player["kills"]:,}',
-            "| Furnace:",
-            player[
-                "furnace_level"
-            ]
+            f'{player["kills"]:,}'
         )
 
 
@@ -1641,7 +1660,7 @@ def main():
 
     # ========================================================
     # STEP 4
-    # WRITE SNAPSHOT TO SUPABASE
+    # WRITE SNAPSHOT
     # ========================================================
 
     cod_activity_success = (
@@ -1653,7 +1672,7 @@ def main():
 
     # ========================================================
     # STEP 5
-    # VERIFY DATABASE
+    # VERIFY WRITE
     # ========================================================
 
     verification_success = False
