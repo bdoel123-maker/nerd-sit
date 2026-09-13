@@ -14,9 +14,8 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "WOS.env"
 
-
-# Load WOS.env locally if it exists.
-# GitHub Actions can use repository secrets/environment variables.
+# Local PC: load WOS.env if it exists
+# GitHub Actions: use repository secrets/environment variables
 if ENV_FILE.exists():
     load_dotenv(ENV_FILE)
 
@@ -52,21 +51,16 @@ SUPABASE_KEY = (
 # ============================================================
 
 if not WOS_TOKEN:
-
     raise ValueError(
         "WOSORACLE_API_TOKEN not found"
     )
 
-
 if not SUPABASE_URL:
-
     raise ValueError(
         "SUPABASE_URL not found"
     )
 
-
 if not SUPABASE_KEY:
-
     raise ValueError(
         "SUPABASE_KEY not found"
     )
@@ -88,19 +82,16 @@ PLAYER_BATCH_DELAY_SECONDS = 2
 
 SUPABASE_BATCH_SIZE = 50
 
+SUPABASE_TABLE = "cod_activity"
+
 
 # ============================================================
 # WOS ORACLE HEADERS
 # ============================================================
 
 WOS_HEADERS = {
-
-    "Authorization":
-        f"Bearer {WOS_TOKEN}",
-
-    "Accept":
-        "application/json"
-
+    "Authorization": f"Bearer {WOS_TOKEN}",
+    "Accept": "application/json"
 }
 
 
@@ -109,16 +100,9 @@ WOS_HEADERS = {
 # ============================================================
 
 SUPABASE_HEADERS = {
-
-    "apikey":
-        SUPABASE_KEY,
-
-    "Authorization":
-        f"Bearer {SUPABASE_KEY}",
-
-    "Content-Type":
-        "application/json"
-
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
 }
 
 
@@ -177,29 +161,18 @@ def oracle_get(
         try:
 
             response = requests.get(
-
                 url,
-
                 headers=WOS_HEADERS,
-
                 timeout=30
-
             )
-
 
         except requests.RequestException as error:
 
             print()
-
             print(
-                f"Network error "
-                f"on {path}:"
+                f"Network error on {path}:"
             )
-
-            print(
-                error
-            )
-
+            print(error)
 
             if attempt > max_retries:
 
@@ -209,17 +182,13 @@ def oracle_get(
 
                 return None
 
-
             wait_time = (
                 attempt * 5
             )
 
-
             print(
-                f"Waiting "
-                f"{wait_time} seconds..."
+                f"Waiting {wait_time} seconds..."
             )
-
 
             time.sleep(
                 wait_time
@@ -237,7 +206,6 @@ def oracle_get(
             try:
 
                 return response.json()
-
 
             except ValueError:
 
@@ -271,11 +239,9 @@ def oracle_get(
 
                 return None
 
-
             wait_time = (
                 attempt * 5
             )
-
 
             print(
                 f"HTTP "
@@ -287,7 +253,6 @@ def oracle_get(
                 f"Retrying in "
                 f"{wait_time} seconds..."
             )
-
 
             time.sleep(
                 wait_time
@@ -328,10 +293,8 @@ def get_state(
 ):
 
     return oracle_get(
-
         f"/api/v1/states/"
         f"{state_id}"
-
     )
 
 
@@ -344,10 +307,8 @@ def get_alliance(
 ):
 
     return oracle_get(
-
         f"/api/v1/alliances/"
         f"{alliance_id}"
-
     )
 
 
@@ -360,10 +321,8 @@ def get_player(
 ):
 
     return oracle_get(
-
         f"/api/v1/players/"
         f"{fid}"
-
     )
 
 
@@ -389,10 +348,6 @@ def discover_cod_players():
 
     print()
 
-
-    # ========================================================
-    # LOAD STATE
-    # ========================================================
 
     state = get_state(
         STATE_ID
@@ -439,12 +394,10 @@ def discover_cod_players():
     for alliance in alliances:
 
         abbreviation = str(
-
             alliance.get(
                 "abbr",
                 ""
             )
-
         ).strip().upper()
 
 
@@ -460,8 +413,7 @@ def discover_cod_players():
         print()
 
         print(
-            "COD alliance "
-            "was not found."
+            "COD alliance was not found."
         )
 
         return []
@@ -526,7 +478,7 @@ def discover_cod_players():
 
 
     # ========================================================
-    # LOAD FULL COD ALLIANCE
+    # LOAD FULL ALLIANCE
     # ========================================================
 
     alliance = get_alliance(
@@ -558,7 +510,7 @@ def discover_cod_players():
 
 
     # ========================================================
-    # CREATE BASE PLAYER LIST
+    # BUILD BASE PLAYER LIST
     # ========================================================
 
     players = []
@@ -567,12 +519,10 @@ def discover_cod_players():
     for member in members:
 
         fid = str(
-
             member.get(
                 "id",
                 ""
             )
-
         ).strip()
 
 
@@ -583,7 +533,6 @@ def discover_cod_players():
 
         players.append(
             {
-
                 "fid":
                     fid,
 
@@ -607,7 +556,6 @@ def discover_cod_players():
                         "furnace_level",
                         ""
                     )
-
             }
         )
 
@@ -617,9 +565,7 @@ def discover_cod_players():
     # ========================================================
 
     players.sort(
-
         key=lambda player:
-
             -(
                 player.get(
                     "power",
@@ -627,7 +573,6 @@ def discover_cod_players():
                 )
                 or 0
             )
-
     )
 
 
@@ -645,7 +590,6 @@ def discover_cod_players():
         "========================================"
     )
 
-
     print(
         f"COD players found: "
         f"{len(players)}"
@@ -656,7 +600,7 @@ def discover_cod_players():
 
 
 # ============================================================
-# FETCH FULL COD PLAYER PROFILES
+# FETCH FULL PLAYER PROFILES
 # ============================================================
 
 def fetch_full_player_profiles(
@@ -701,20 +645,14 @@ def fetch_full_player_profiles(
     ):
 
         batch = players[
-
             start:
             start + PLAYER_BATCH_SIZE
-
         ]
 
 
         batch_end = min(
-
-            start
-            + PLAYER_BATCH_SIZE,
-
+            start + PLAYER_BATCH_SIZE,
             total_players
-
         )
 
 
@@ -727,7 +665,6 @@ def fetch_full_player_profiles(
             f"of "
             f"{total_players}"
         )
-
 
         print(
             "----------------------------------------"
@@ -752,16 +689,11 @@ def fetch_full_player_profiles(
             )
 
 
-            # =================================================
-            # FAILED PROFILE
-            # =================================================
-
             if not player:
 
                 failed_profiles.append(
                     base_player
                 )
-
 
                 print(
                     "FAILED:",
@@ -776,27 +708,22 @@ def fetch_full_player_profiles(
 
 
             # =================================================
-            # CHECK LIVE ALLIANCE
+            # CURRENT ALLIANCE
             # =================================================
 
             alliance_data = (
-
                 player.get(
                     "alliance"
                 )
-
                 or {}
-
             )
 
 
             current_alliance = str(
-
                 alliance_data.get(
                     "abbr",
                     ""
                 )
-
             ).strip().upper()
 
 
@@ -808,7 +735,6 @@ def fetch_full_player_profiles(
 
                 skipped_profiles.append(
                     {
-
                         "fid":
                             fid,
 
@@ -822,7 +748,6 @@ def fetch_full_player_profiles(
 
                         "alliance":
                             current_alliance
-
                     }
                 )
 
@@ -839,7 +764,6 @@ def fetch_full_player_profiles(
                     current_alliance
                 )
 
-
                 continue
 
 
@@ -850,7 +774,6 @@ def fetch_full_player_profiles(
             full_profile = {
 
                 "fid":
-
                     str(
                         player.get(
                             "id",
@@ -858,9 +781,7 @@ def fetch_full_player_profiles(
                         )
                     ),
 
-
                 "name":
-
                     player.get(
                         "name",
                         base_player[
@@ -868,22 +789,16 @@ def fetch_full_player_profiles(
                         ]
                     ),
 
-
                 "alliance":
-
                     "COD",
 
-
                 "state":
-
                     player.get(
                         "state",
                         STATE_ID
                     ),
 
-
                 "furnace_level":
-
                     player.get(
                         "furnace_level",
                         base_player[
@@ -891,9 +806,7 @@ def fetch_full_player_profiles(
                         ]
                     ),
 
-
                 "power":
-
                     player.get(
                         "power",
                         base_player[
@@ -902,34 +815,26 @@ def fetch_full_player_profiles(
                     )
                     or 0,
 
-
                 "kills":
-
                     player.get(
                         "kills",
                         0
                     )
                     or 0,
 
-
                 "labyrinth_score":
-
                     player.get(
                         "labyrinth_score",
                         0
                     )
                     or 0,
 
-
                 "active":
-
                     player.get(
                         "active"
                     ),
 
-
                 "updated_at":
-
                     player.get(
                         "updated_at"
                     )
@@ -955,7 +860,7 @@ def fetch_full_player_profiles(
 
 
         # ====================================================
-        # DELAY BETWEEN PLAYER BATCHES
+        # WAIT BETWEEN BATCHES
         # ====================================================
 
         if batch_end < total_players:
@@ -965,7 +870,6 @@ def fetch_full_player_profiles(
                 f"{PLAYER_BATCH_DELAY_SECONDS} "
                 f"seconds before next batch..."
             )
-
 
             time.sleep(
                 PLAYER_BATCH_DELAY_SECONDS
@@ -1004,8 +908,7 @@ def fetch_full_player_profiles(
 
 
     print(
-        f"Skipped because "
-        f"not COD: "
+        f"Skipped because not COD: "
         f"{len(skipped_profiles)}"
     )
 
@@ -1018,7 +921,7 @@ def fetch_full_player_profiles(
 
 
 # ============================================================
-# WRITE COD ACTIVITY SNAPSHOT TO SUPABASE
+# WRITE COD ACTIVITY SNAPSHOT
 # ============================================================
 
 def write_cod_activity(
@@ -1043,16 +946,11 @@ def write_cod_activity(
     if not profiles:
 
         print(
-            "No COD profiles "
-            "to write."
+            "No COD profiles to write."
         )
 
         return False
 
-
-    # ========================================================
-    # ONE TIMESTAMP FOR THE ENTIRE RUN
-    # ========================================================
 
     captured_at = utc_now()
 
@@ -1061,7 +959,7 @@ def write_cod_activity(
 
 
     # ========================================================
-    # BUILD SUPABASE ROWS
+    # BUILD DATABASE ROWS
     # ========================================================
 
     for player in profiles:
@@ -1069,50 +967,37 @@ def write_cod_activity(
         row = {
 
             "fid":
-
                 str(
                     player[
                         "fid"
                     ]
                 ),
 
-
             "player_name":
-
                 player[
                     "name"
                 ],
 
-
             "alliance":
-
                 "COD",
 
-
             "state":
-
                 STATE_ID,
 
-
             "furnace_level":
-
                 (
                     str(
                         player[
                             "furnace_level"
                         ]
                     )
-                    if
-                    player.get(
+                    if player.get(
                         "furnace_level"
-                    )
-                    is not None
+                    ) is not None
                     else None
                 ),
 
-
             "total_power":
-
                 int(
                     player.get(
                         "power",
@@ -1121,9 +1006,7 @@ def write_cod_activity(
                     or 0
                 ),
 
-
             "kills":
-
                 int(
                     player.get(
                         "kills",
@@ -1132,9 +1015,7 @@ def write_cod_activity(
                     or 0
                 ),
 
-
             "labyrinth_score":
-
                 int(
                     player.get(
                         "labyrinth_score",
@@ -1143,16 +1024,12 @@ def write_cod_activity(
                     or 0
                 ),
 
-
             "active":
-
                 player.get(
                     "active"
                 ),
 
-
             "api_updated":
-
                 (
                     player.get(
                         "updated_at"
@@ -1160,11 +1037,8 @@ def write_cod_activity(
                     or None
                 ),
 
-
             "captured_at":
-
                 captured_at
-
         }
 
 
@@ -1178,11 +1052,9 @@ def write_cod_activity(
     # ========================================================
 
     url = (
-
         f"{SUPABASE_URL}"
         f"/rest/v1/"
-        f"cod_activity"
-
+        f"{SUPABASE_TABLE}"
     )
 
 
@@ -1192,18 +1064,15 @@ def write_cod_activity(
 
 
     # ========================================================
-    # WRITE IN BATCHES
+    # WRITE BATCHES
     # ========================================================
 
     for batch_number, batch in enumerate(
-
         chunks(
             rows,
             SUPABASE_BATCH_SIZE
         ),
-
         start=1
-
     ):
 
         headers = (
@@ -1230,17 +1099,11 @@ def write_cod_activity(
         try:
 
             response = requests.post(
-
                 url,
-
                 headers=headers,
-
                 json=batch,
-
                 timeout=30
-
             )
-
 
         except requests.RequestException as error:
 
@@ -1249,7 +1112,6 @@ def write_cod_activity(
                 f"{batch_number} "
                 f"connection error:"
             )
-
 
             print(
                 error
@@ -1261,6 +1123,12 @@ def write_cod_activity(
             )
 
             continue
+
+
+        print(
+            "Supabase HTTP:",
+            response.status_code
+        )
 
 
         # ====================================================
@@ -1353,7 +1221,226 @@ def write_cod_activity(
 
 
 # ============================================================
-# DISPLAY TOP COD PLAYERS
+# VERIFY COD ACTIVITY
+# ============================================================
+
+def verify_cod_activity():
+
+    print()
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "       VERIFYING COD ACTIVITY"
+    )
+
+    print(
+        "========================================"
+    )
+
+
+    print(
+        "Supabase URL:",
+        SUPABASE_URL
+    )
+
+    print(
+        "Table:",
+        SUPABASE_TABLE
+    )
+
+
+    url = (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/"
+        f"{SUPABASE_TABLE}"
+    )
+
+
+    headers = {
+
+        "apikey":
+            SUPABASE_KEY,
+
+        "Authorization":
+            f"Bearer {SUPABASE_KEY}",
+
+        "Accept":
+            "application/json"
+
+    }
+
+
+    params = {
+
+        "select":
+            (
+                "id,"
+                "fid,"
+                "player_name,"
+                "total_power,"
+                "kills,"
+                "captured_at"
+            ),
+
+        "order":
+            "captured_at.desc",
+
+        "limit":
+            "10"
+
+    }
+
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=30
+        )
+
+
+    except requests.RequestException as error:
+
+        print(
+            "Verification request failed:"
+        )
+
+        print(
+            error
+        )
+
+        return False
+
+
+    print(
+        "Verification HTTP:",
+        response.status_code
+    )
+
+
+    if response.status_code != 200:
+
+        print(
+            "Verification failed."
+        )
+
+        print(
+            response.text
+        )
+
+        return False
+
+
+    try:
+
+        rows = (
+            response.json()
+        )
+
+    except ValueError:
+
+        print(
+            "Verification returned "
+            "invalid JSON."
+        )
+
+        print(
+            response.text
+        )
+
+        return False
+
+
+    print(
+        "Rows returned:",
+        len(rows)
+    )
+
+
+    if not rows:
+
+        print()
+
+        print(
+            "WARNING:"
+        )
+
+        print(
+            "Insert reported success, "
+            "but cod_activity returned "
+            "zero rows."
+        )
+
+        return False
+
+
+    print()
+
+    print(
+        "LATEST DATABASE ROWS"
+    )
+
+    print(
+        "----------------------------------------"
+    )
+
+
+    for row in rows:
+
+        power = (
+            row.get(
+                "total_power",
+                0
+            )
+            or 0
+        )
+
+
+        kills = (
+            row.get(
+                "kills",
+                0
+            )
+            or 0
+        )
+
+
+        print(
+            row.get(
+                "player_name"
+            ),
+            "| FID:",
+            row.get(
+                "fid"
+            ),
+            "| Power:",
+            f"{power:,}",
+            "| Kills:",
+            f"{kills:,}",
+            "| Captured:",
+            row.get(
+                "captured_at"
+            )
+        )
+
+
+    print()
+
+    print(
+        "COD activity verification SUCCESS."
+    )
+
+
+    return True
+
+
+# ============================================================
+# DISPLAY CURRENT COD PLAYERS
 # ============================================================
 
 def display_profiles(
@@ -1376,11 +1463,8 @@ def display_profiles(
 
 
     sorted_profiles = sorted(
-
         profiles,
-
         key=lambda player:
-
             -(
                 player.get(
                     "power",
@@ -1388,7 +1472,6 @@ def display_profiles(
                 )
                 or 0
             )
-
     )
 
 
@@ -1398,33 +1481,22 @@ def display_profiles(
     ):
 
         print(
-
             f"{position:>3}. ",
-
             player[
                 "name"
             ],
-
             "|",
-
             player[
                 "fid"
             ],
-
             "| Power:",
-
             f'{player["power"]:,}',
-
             "| Kills:",
-
             f'{player["kills"]:,}',
-
             "| Furnace:",
-
             player[
                 "furnace_level"
             ]
-
         )
 
 
@@ -1475,6 +1547,33 @@ def main():
 
 
     # ========================================================
+    # DATABASE DESTINATION
+    # ========================================================
+
+    print()
+
+    print(
+        "DATABASE DESTINATION"
+    )
+
+    print(
+        "----------------------------------------"
+    )
+
+    print(
+        "Supabase URL:",
+        SUPABASE_URL
+    )
+
+    print(
+        "Table:",
+        SUPABASE_TABLE
+    )
+
+    print()
+
+
+    # ========================================================
     # STEP 1
     # DISCOVER COD
     # ========================================================
@@ -1508,7 +1607,6 @@ def main():
         full_profiles,
         failed_profiles,
         skipped_profiles
-
     ) = fetch_full_player_profiles(
         players
     )
@@ -1543,16 +1641,29 @@ def main():
 
     # ========================================================
     # STEP 4
-    # WRITE NEW SNAPSHOT TO cod_activity
+    # WRITE SNAPSHOT TO SUPABASE
     # ========================================================
 
     cod_activity_success = (
-
         write_cod_activity(
             full_profiles
         )
-
     )
+
+
+    # ========================================================
+    # STEP 5
+    # VERIFY DATABASE
+    # ========================================================
+
+    verification_success = False
+
+
+    if cod_activity_success:
+
+        verification_success = (
+            verify_cod_activity()
+        )
 
 
     # ========================================================
@@ -1603,6 +1714,16 @@ def main():
         (
             "SUCCESS"
             if cod_activity_success
+            else "CHECK ERRORS"
+        )
+    )
+
+
+    print(
+        "Supabase verification:",
+        (
+            "SUCCESS"
+            if verification_success
             else "CHECK ERRORS"
         )
     )
