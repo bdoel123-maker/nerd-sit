@@ -8,7 +8,6 @@ on:
 
 jobs:
   collect-onf-activity:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -16,22 +15,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Debug repository files
+      - name: Show repository structure
         run: |
+          echo "GITHUB_WORKSPACE:"
+          echo "$GITHUB_WORKSPACE"
+
+          echo ""
           echo "Current directory:"
           pwd
 
-          echo "Root files:"
+          echo ""
+          echo "Files in root:"
           ls -la
 
-          echo "All Python files:"
-          find . -type f -name "*.py" -print
+          echo ""
+          echo "ALL Python files:"
+          find "$GITHUB_WORKSPACE" -type f -name "*.py" -print
 
-          echo "Git branch:"
-          git branch --show-current
-
-          echo "Git status:"
-          git status
+          echo ""
+          echo "Anything containing onf:"
+          find "$GITHUB_WORKSPACE" -type f -iname "*onf*" -print
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,4 +52,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          python ./onf_collector.py
+          python "$GITHUB_WORKSPACE/onf_collector.py"
