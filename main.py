@@ -283,9 +283,83 @@ def get_player(fid):
 
 def get_standings(fid):
 
-    return oracle_get(
-        f"/api/players/{fid}/standings"
-    )
+    path = f"/api/players/{fid}/standings"
+    url = f"https://wosoracle.com{path}"
+
+    for attempt in range(1, MAX_RETRIES + 2):
+
+        try:
+            response = requests.get(
+                url,
+                headers=WOS_HEADERS,
+                timeout=30,
+            )
+
+        except requests.RequestException as error:
+            print(
+                f"STANDINGS NETWORK ERROR | {fid} | {error}"
+            )
+
+            if attempt > MAX_RETRIES:
+                return None
+
+            wait_time = attempt * 5
+            print(f"Standings retry in {wait_time}s...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError:
+                print(f"STANDINGS INVALID JSON | {fid}")
+                return None
+
+        if response.status_code == 401:
+            print(
+                f"STANDINGS AUTH REQUIRED | {fid} | "
+                "preserving existing standings"
+            )
+            return None
+
+        if (
+            response.status_code == 429
+            or response.status_code == 408
+            or response.status_code == 425
+            or response.status_code >= 500
+        ):
+            if attempt > MAX_RETRIES:
+                print(
+                    f"STANDINGS GAVE UP | {fid} | "
+                    f"HTTP {response.status_code} | "
+                    "preserving existing standings"
+                )
+                return None
+
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_time = int(retry_after)
+                except ValueError:
+                    wait_time = attempt * 5
+            else:
+                wait_time = attempt * 5
+
+            print(
+                f"STANDINGS HTTP {response.status_code} | {fid} | "
+                f"retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
+            continue
+
+        print(
+            f"STANDINGS UNAVAILABLE | {fid} | "
+            f"HTTP {response.status_code} | "
+            "preserving existing standings"
+        )
+        return None
+
+    return None
 
 
 # ============================================================
@@ -887,10 +961,7 @@ def make_database_row(
     base_player,
 ):
 
-    standings = extract_standings_data(
-        standings_data
-    )
-
+    standings = extract_standings_data(standings_data)
 
     fid = str(
         player.get(
@@ -899,142 +970,56 @@ def make_database_row(
         )
     ).strip()
 
-
-    # --------------------------------------------------------
-    # PLAYER POWER
-    #
-    # Prefer /api/v1/players/{fid}.
-    # Fall back to standings Personal Power.
-    # Fall back to alliance roster power.
-    # --------------------------------------------------------
-
-    power = player.get(
-        "power"
-    )
-
+    # Prefer profile power, then standings Personal Power, then roster power.
+    power = player.get("power")
 
     if power is None:
-
-        power = standings.get(
-            "personal_power"
-        )
-
+        power = standings.get("personal_power")
 
     if power is None:
-
-        power = base_player.get(
-            "power"
-        )
-
-
-    # --------------------------------------------------------
-    # ALLIANCE
-    # --------------------------------------------------------
+        power = base_player.get("power")
 
     alliance = extract_alliance(
         player,
         base_player["alliance"],
     )
 
-
-    # Preserve the alliance tag exactly.
-    # No upper/lower conversion.
-
+    # Preserve the roster alliance for this sync if the profile reports
+    # an alliance outside our target set. Case is intentionally preserved.
     if alliance not in TARGET_ALLIANCES:
-
-        # The player may have moved after discovery.
-        # Preserve the alliance from the roster scan for
-        # consistency with this sync.
-
         alliance = base_player["alliance"]
 
-
-    # --------------------------------------------------------
-    # DATABASE ROW
-    # --------------------------------------------------------
-
-    return {
-
-        "fid":
-            int(fid),
-
-        "player":
-            player.get(
-                "name",
-                base_player["name"],
-            ),
-
-        "alliance":
-            alliance,
-
-        "state":
-            player.get(
-                "state",
-                STATE_ID,
-            ),
-
-        "furnace_level":
-            player.get(
-                "furnace_level",
-                base_player["furnace_level"],
-            ),
-
-        "power":
-            power,
-
-        "kills":
-            player.get(
-                "kills",
-                0,
-            ) or 0,
-
-        "labyrinth_score":
-            player.get(
-                "labyrinth_score",
-                0,
-            ) or 0,
-
-        "pet_power":
-            standings.get(
-                "pet_power"
-            ),
-
-        "island_prosperity":
-            standings.get(
-                "island_prosperity"
-            ),
-
-        "hero_power":
-            standings.get(
-                "hero_power"
-            ),
-
-        "hero_gear_power":
-            standings.get(
-                "hero_gear_power"
-            ),
-
-        "expert_power":
-            standings.get(
-                "expert_power"
-            ),
-
-        "active":
-            player.get(
-                "active"
-            ),
-
-        "api_updated":
-            player.get(
-                "updated_at"
-            ),
-
-        "standings_updated":
-            standings.get(
-                "standings_updated"
-            ),
-
+    # Base fields are always safe to update.
+    row = {
+        "fid": int(fid),
+        "player": player.get("name", base_player["name"]),
+        "alliance": alliance,
+        "state": player.get("state", STATE_ID),
+        "furnace_level": player.get(
+            "furnace_level",
+            base_player["furnace_level"],
+        ),
+        "power": power,
+        "kills": player.get("kills", 0) or 0,
+        "labyrinth_score": player.get("labyrinth_score", 0) or 0,
+        "active": player.get("active"),
+        "api_updated": player.get("updated_at"),
     }
+
+    # Only include standings columns when the standings endpoint succeeded.
+    # If standings is unavailable (including HTTP 401), these keys are
+    # omitted so an upsert cannot replace existing values with NULL.
+    if standings_data is not None:
+        row.update({
+            "pet_power": standings.get("pet_power"),
+            "island_prosperity": standings.get("island_prosperity"),
+            "hero_power": standings.get("hero_power"),
+            "hero_gear_power": standings.get("hero_gear_power"),
+            "expert_power": standings.get("expert_power"),
+            "standings_updated": standings.get("standings_updated"),
+        })
+
+    return row
 
 
 # ============================================================
@@ -1084,21 +1069,18 @@ def fetch_complete_player(base_player):
 # SUPABASE UPSERT
 # ============================================================
 
-def upsert_players(rows):
+def _upsert_player_group(rows, label):
 
     if not rows:
         return True
 
-
     endpoint = (
         f"{SUPABASE_URL}"
-            f"/rest/v1/players"
+        f"/rest/v1/players"
         f"?on_conflict=fid"
     )
 
-
     try:
-
         response = requests.post(
             endpoint,
             headers=SUPABASE_HEADERS,
@@ -1107,34 +1089,62 @@ def upsert_players(rows):
         )
 
     except requests.RequestException as error:
-
         print(
-            f"SUPABASE NETWORK ERROR | {error}"
+            f"SUPABASE NETWORK ERROR | {label} | {error}"
         )
-
         return False
 
-
     if 200 <= response.status_code < 300:
-
         print(
-            f"DATABASE: "
-            f"{len(rows)} players saved."
+            f"DATABASE: {len(rows)} players saved "
+            f"({label})."
         )
-
         return True
-
 
     print()
     print(
-        f"SUPABASE ERROR | HTTP "
-        f"{response.status_code}"
+        f"SUPABASE ERROR | {label} | "
+        f"HTTP {response.status_code}"
     )
-
     print(response.text)
     print()
-
     return False
+
+
+def upsert_players(rows):
+
+    if not rows:
+        return True
+
+    # PostgREST bulk payloads are safest when every object has the same
+    # column set. Split rows so a standings failure never causes mixed-key
+    # payloads and never overwrites previously collected standings with NULL.
+    rows_with_standings = []
+    rows_without_standings = []
+
+    for row in rows:
+        if "standings_updated" in row:
+            rows_with_standings.append(row)
+        else:
+            rows_without_standings.append(row)
+
+    success = True
+
+    for start in range(0, len(rows_with_standings), SUPABASE_BATCH_SIZE):
+        group = rows_with_standings[
+            start:start + SUPABASE_BATCH_SIZE
+        ]
+        if not _upsert_player_group(group, "with standings"):
+            success = False
+
+    for start in range(0, len(rows_without_standings), SUPABASE_BATCH_SIZE):
+        group = rows_without_standings[
+            start:start + SUPABASE_BATCH_SIZE
+        ]
+        if not _upsert_player_group(group, "standings preserved"):
+            success = False
+
+    return success
 
 
 # ============================================================
@@ -1285,29 +1295,41 @@ def fetch_and_save_players(players):
                     else "NULL"
                 )
 
-                pet_display = (
-                    f"{row['pet_power']:,}"
-                    if row["pet_power"] is not None
-                    else "NULL"
+                pet_power = row.get("pet_power")
+                hero_power = row.get("hero_power")
+                gear_power = row.get("hero_gear_power")
+                expert_power = row.get("expert_power")
+
+                standings_preserved = (
+                    "standings_updated" not in row
                 )
 
-                hero_display = (
-                    f"{row['hero_power']:,}"
-                    if row["hero_power"] is not None
-                    else "NULL"
-                )
-
-                gear_display = (
-                    f"{row['hero_gear_power']:,}"
-                    if row["hero_gear_power"] is not None
-                    else "NULL"
-                )
-
-                expert_display = (
-                    f"{row['expert_power']:,}"
-                    if row["expert_power"] is not None
-                    else "NULL"
-                )
+                if standings_preserved:
+                    pet_display = "PRESERVED"
+                    hero_display = "PRESERVED"
+                    gear_display = "PRESERVED"
+                    expert_display = "PRESERVED"
+                else:
+                    pet_display = (
+                        f"{pet_power:,}"
+                        if pet_power is not None
+                        else "NULL"
+                    )
+                    hero_display = (
+                        f"{hero_power:,}"
+                        if hero_power is not None
+                        else "NULL"
+                    )
+                    gear_display = (
+                        f"{gear_power:,}"
+                        if gear_power is not None
+                        else "NULL"
+                    )
+                    expert_display = (
+                        f"{expert_power:,}"
+                        if expert_power is not None
+                        else "NULL"
+                    )
 
 
                 print(
