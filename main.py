@@ -1,26 +1,40 @@
 import os
 import time
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from pathlib import Path
 from dotenv import load_dotenv
 
 
 # ============================================================
-# LOAD WOS TOKEN
+# LOAD ENVIRONMENT
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "WOS.env"
 
+# Loads WOS.env locally.
+# In GitHub Actions, existing environment variables still work.
 load_dotenv(ENV_FILE)
 
+
 TOKEN = os.getenv("WOSORACLE_API_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
 
 if not TOKEN:
     raise ValueError(
-        "WOSORACLE_API_TOKEN not found in WOS.env"
+        "WOSORACLE_API_TOKEN not found."
+    )
+
+if not SUPABASE_URL:
+    raise ValueError(
+        "SUPABASE_URL not found."
+    )
+
+if not SUPABASE_KEY:
+    raise ValueError(
+        "SUPABASE_KEY not found."
     )
 
 
@@ -37,16 +51,32 @@ TARGET_ALLIANCES = {
     "300"
 }
 
+SUPABASE_TABLE = "players"
+
 MAX_RETRIES = 3
 
 PLAYER_BATCH_SIZE = 8
 
 BATCH_DELAY_SECONDS = 2
 
+SUPABASE_BATCH_SIZE = 100
 
-HEADERS = {
+
+# ============================================================
+# HEADERS
+# ============================================================
+
+ORACLE_HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/json"
+}
+
+
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates,return=minimal"
 }
 
 
@@ -64,7 +94,7 @@ def oracle_get(path, max_retries=MAX_RETRIES):
 
             response = requests.get(
                 url,
-                headers=HEADERS,
+                headers=ORACLE_HEADERS,
                 timeout=30
             )
 
@@ -763,6 +793,164 @@ def fetch_full_player_profiles(players):
 
 
 # ============================================================
+# CONVERT ORACLE PROFILE TO PLAYERS TABLE ROW
+# ============================================================
+
+def build_supabase_row(player):
+
+    return {
+
+        "fid":
+            player["fid"],
+
+        "player_name":
+            player["name"],
+
+        "alliance":
+            player["alliance"],
+
+        "state":
+            player["state"],
+
+        "furnace_level":
+            player["furnace_level"],
+
+        "power":
+            player["power"],
+
+        "active":
+            player["active"]
+
+    }
+
+
+# ============================================================
+# UPSERT PLAYERS INTO SUPABASE
+# ============================================================
+
+def upsert_players_to_supabase(players):
+
+    print()
+    print("========================================")
+    print("        WRITING TO SUPABASE")
+    print("========================================")
+    print()
+
+    if not players:
+
+        print(
+            "No player profiles to write."
+        )
+
+        return False
+
+
+    rows = [
+        build_supabase_row(player)
+        for player in players
+    ]
+
+
+    url = (
+        f"{SUPABASE_URL.rstrip('/')}"
+        f"/rest/v1/{SUPABASE_TABLE}"
+        f"?on_conflict=fid"
+    )
+
+
+    total_rows = len(rows)
+
+    successful_rows = 0
+
+
+    for start in range(
+        0,
+        total_rows,
+        SUPABASE_BATCH_SIZE
+    ):
+
+        batch = rows[
+            start:
+            start + SUPABASE_BATCH_SIZE
+        ]
+
+
+        batch_end = min(
+            start + SUPABASE_BATCH_SIZE,
+            total_rows
+        )
+
+
+        print(
+            f"Writing rows "
+            f"{start + 1}-{batch_end} "
+            f"of {total_rows}..."
+        )
+
+
+        try:
+
+            response = requests.post(
+                url,
+                headers=SUPABASE_HEADERS,
+                json=batch,
+                timeout=60
+            )
+
+        except requests.RequestException as error:
+
+            print()
+            print(
+                "SUPABASE NETWORK ERROR:"
+            )
+
+            print(error)
+
+            return False
+
+
+        if response.status_code not in (
+            200,
+            201,
+            204
+        ):
+
+            print()
+            print(
+                "SUPABASE WRITE FAILED"
+            )
+
+            print(
+                f"HTTP {response.status_code}"
+            )
+
+            print(
+                response.text
+            )
+
+            return False
+
+
+        successful_rows += len(batch)
+
+        print(
+            f"OK: {len(batch)} rows upserted."
+        )
+
+
+    print()
+    print("----------------------------------------")
+
+    print(
+        f"Successfully upserted "
+        f"{successful_rows} players "
+        f"into '{SUPABASE_TABLE}'."
+    )
+
+    return True
+
+
+# ============================================================
 # RUN PROGRAM
 # ============================================================
 
@@ -814,6 +1002,17 @@ for player in full_profiles[:10]:
 
 
 # ============================================================
+# WRITE TO SUPABASE
+# ============================================================
+
+supabase_success = (
+    upsert_players_to_supabase(
+        full_profiles
+    )
+)
+
+
+# ============================================================
 # SHOW FAILURES
 # ============================================================
 
@@ -835,7 +1034,23 @@ if failed_profiles:
         )
 
 
+# ============================================================
+# FINAL STATUS
+# ============================================================
+
 print()
 print("========================================")
-print("              ALL DONE")
+
+if supabase_success:
+
+    print(
+        " COLLECTION + DATABASE UPDATE COMPLETE"
+    )
+
+else:
+
+    print(
+        " COLLECTION COMPLETE / DATABASE FAILED"
+    )
+
 print("========================================")
