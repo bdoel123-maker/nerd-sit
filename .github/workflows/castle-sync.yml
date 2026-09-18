@@ -1,25 +1,28 @@
 name: State 2348 Castle Sync
 
 on:
-  # Manual run button
+  # Allows you to run it manually from GitHub Actions
   workflow_dispatch:
 
-  # Automatic schedule
+  # Automatic Castle sync
   schedule:
-    # Every 12 hours
-    - cron: "15 */12 * * *"
+    # Runs every 3rd calendar day at 00:15 UTC
+    - cron: "15 0 */3 * *"
+
 
 jobs:
+
   castle-sync:
 
     runs-on: ubuntu-latest
 
     timeout-minutes: 30
 
+
     steps:
 
       # ======================================================
-      # CHECKOUT
+      # CHECKOUT REPOSITORY
       # ======================================================
 
       - name: Checkout repository
@@ -27,7 +30,7 @@ jobs:
 
 
       # ======================================================
-      # PYTHON
+      # SET UP PYTHON
       # ======================================================
 
       - name: Set up Python
@@ -37,7 +40,7 @@ jobs:
 
 
       # ======================================================
-      # DEPENDENCIES
+      # INSTALL DEPENDENCIES
       # ======================================================
 
       - name: Upgrade pip
