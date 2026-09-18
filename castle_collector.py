@@ -1,134 +1,56 @@
-# ============================================================
-# CASTLE COLLECTOR
-# STATE 2348
-#
-# Google Sheets
-#   Castle Availability
-#   roster_data
-#       ↓
-# WOS Oracle State 2348
-#       ↓
-# Merge by FID
-#       ↓
-# Supabase castle_players
-# ============================================================
-
 import os
-import sys
-import time
 from io import StringIO
 from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 
+# Use the WORKING state discovery from main.py
+from main import discover_players
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-STATE_ID = 2348
+SPREADSHEET_ID = "1eR-gUtOlnvhS8Ixc8tSWjjoH-T21iQqd_VtYYbA_-3s"
 
-SPREADSHEET_ID = (
-    "1eR-gUtOlnvhS8Ixc8tSWjjoH-T21iQqd_VtYYbA_-3s"
-)
-
-# Actual GIDs from your spreadsheet
 AVAILABILITY_GID = "37539478"
 ROSTER_GID = "44400222"
 
 SUPABASE_TABLE = "castle_players"
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
 REQUEST_TIMEOUT = 45
-MAX_RETRIES = 4
-UPSERT_BATCH_SIZE = 100
+BATCH_SIZE = 100
+
+
+if not SUPABASE_URL:
+    raise ValueError("SUPABASE_URL not found")
+
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY not found")
 
 
 # ============================================================
-# ENVIRONMENT
+# HELPERS
 # ============================================================
 
-SUPABASE_URL = (
-    os.environ.get("SUPABASE_URL", "")
-    .strip()
-    .rstrip("/")
-)
-
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_KEY", "")
-    .strip()
-)
-
-WOSORACLE_API_TOKEN = (
-    os.environ.get("WOSORACLE_API_TOKEN", "")
-    .strip()
-)
-
-WOSORACLE_BASE_URL = (
-    os.environ.get(
-        "WOSORACLE_BASE_URL",
-        "https://wosoracle.com"
-    )
-    .strip()
-    .rstrip("/")
-)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-def log(message):
-    timestamp = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-
+def log(message=""):
     print(
-        f"[{timestamp}] {message}",
-        flush=True
+        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] "
+        f"{message}",
+        flush=True,
     )
 
 
-def utc_now():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# ============================================================
-# VALIDATE ENVIRONMENT
-# ============================================================
-
-def validate_environment():
-
-    missing = []
-
-    if not SUPABASE_URL:
-        missing.append("SUPABASE_URL")
-
-    if not SUPABASE_KEY:
-        missing.append("SUPABASE_KEY")
-
-    if not WOSORACLE_API_TOKEN:
-        missing.append(
-            "WOSORACLE_API_TOKEN"
-        )
-
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variables: "
-            + ", ".join(missing)
-        )
-
-    log("Environment variables loaded")
-
-
-# ============================================================
-# VALUE CLEANING
-# ============================================================
-
-def clean_string(value):
-
+def clean(value):
     if value is None:
         return None
 
@@ -149,221 +71,108 @@ def clean_string(value):
         "null",
         "#n/a",
         "#ref!",
-        "#value!"
+        "#value!",
     }:
         return None
 
     return value
 
 
-def clean_player_id(value):
-
-    value = clean_string(value)
+def fid_value(value):
+    value = clean(value)
 
     if not value:
         return None
 
-    # Pandas sometimes reads IDs as:
-    # 345410747.0
+    value = value.replace(",", "")
+
     if value.endswith(".0"):
         value = value[:-2]
-
-    # Remove commas if Sheets formatted it
-    value = value.replace(",", "")
 
     if not value.isdigit():
         return None
 
-    try:
-        return int(value)
+    return int(value)
 
-    except ValueError:
+
+def integer(value):
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
         return None
 
 
-def clean_integer(value):
+def boolean(value):
+    value = clean(value)
 
-    if value is None:
-        return None
-
-    try:
-
-        if pd.isna(value):
-            return None
-
-    except Exception:
-        pass
-
-    if isinstance(value, int):
-        return value
-
-    value = str(value)
-
-    value = (
+    return bool(
         value
-        .replace(",", "")
-        .replace(" ", "")
-        .strip()
+        and value.casefold() in {
+            "yes",
+            "y",
+            "true",
+            "1",
+        }
     )
 
-    if not value:
-        return None
 
-    try:
-        return int(float(value))
-
-    except Exception:
-        return None
-
-
-def yes_no(value):
-
-    value = clean_string(value)
-
-    if not value:
-        return False
-
-    return value.casefold() in {
-        "yes",
-        "y",
-        "true",
-        "1"
-    }
-
-
-def same_text(a, b):
-
-    a = clean_string(a)
-    b = clean_string(b)
+def same(a, b):
+    a = clean(a)
+    b = clean(b)
 
     if not a or not b:
         return True
 
-    return (
-        a.casefold()
-        ==
-        b.casefold()
-    )
+    return a.casefold() == b.casefold()
 
 
 # ============================================================
 # GOOGLE SHEETS
 # ============================================================
 
-def google_csv_url(gid):
-
-    return (
-        "https://docs.google.com/"
-        "spreadsheets/d/"
+def read_sheet(gid, header=0):
+    url = (
+        f"https://docs.google.com/spreadsheets/d/"
         f"{SPREADSHEET_ID}/export"
         f"?format=csv&gid={gid}"
     )
 
+    log(f"Downloading Google Sheet GID {gid}")
 
-def download_google_sheet(gid):
+    response = requests.get(
+        url,
+        timeout=REQUEST_TIMEOUT,
+    )
 
-    url = google_csv_url(gid)
+    response.raise_for_status()
 
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            log(
-                f"Downloading Google Sheet "
-                f"GID {gid}"
-            )
-
-            response = requests.get(
-                url,
-                timeout=REQUEST_TIMEOUT
-            )
-
-            response.raise_for_status()
-
-            if not response.text.strip():
-                raise RuntimeError(
-                    "Google returned an empty CSV"
-                )
-
-            return response.text
-
-        except Exception as exc:
-
-            if attempt >= MAX_RETRIES:
-                raise
-
-            wait = attempt * 3
-
-            log(
-                f"Google Sheet error: {exc}"
-            )
-
-            log(
-                f"Retrying in {wait}s..."
-            )
-
-            time.sleep(wait)
+    return pd.read_csv(
+        StringIO(response.text),
+        header=header,
+        dtype=str,
+    )
 
 
 # ============================================================
 # CASTLE AVAILABILITY
 # ============================================================
 
-def load_castle_availability():
+def load_availability():
+    log("Loading Castle Availability")
 
-    log(
-        "Loading Castle Availability"
-    )
-
-    csv_text = download_google_sheet(
-        AVAILABILITY_GID
-    )
-
-    # Row 3 contains headers.
-    #
-    # CSV indexing:
-    # row 1 = blank
-    # row 2 = blank
-    # row 3 = header
-    #
-    # Therefore header=2.
-    df = pd.read_csv(
-        StringIO(csv_text),
+    # Actual headers are row 3
+    df = read_sheet(
+        AVAILABILITY_GID,
         header=2,
-        dtype=str
     )
 
-    log(
-        f"Availability rows read: "
-        f"{len(df)}"
-    )
-
-    required_columns = [
-        "Player ID",
-        "Alliance",
-        "Player Name",
-        "Role"
-    ]
-
-    for column in required_columns:
-
-        if column not in df.columns:
-
-            raise RuntimeError(
-                "Castle Availability is "
-                f"missing column: {column}"
-            )
+    log(f"Availability rows read: {len(df)}")
 
     players = {}
-
     duplicates = 0
 
     for _, row in df.iterrows():
-
-        fid = clean_player_id(
+        fid = fid_value(
             row.get("Player ID")
         )
 
@@ -371,168 +180,91 @@ def load_castle_availability():
             continue
 
         if fid in players:
-
             duplicates += 1
 
             log(
                 f"DUPLICATE FID | {fid} | "
-                f"{clean_string(row.get('Player Name'))}"
+                f"{clean(row.get('Player Name'))}"
             )
 
-        player = {
-
-            "player_id":
-                fid,
+        players[fid] = {
+            "player_id": fid,
 
             "sheet_player_name":
-                clean_string(
-                    row.get("Player Name")
-                ),
+                clean(row.get("Player Name")),
 
             "sheet_alliance":
-                clean_string(
-                    row.get("Alliance")
-                ),
+                clean(row.get("Alliance")),
 
             "role":
-                clean_string(
-                    row.get("Role")
-                ),
-
-            # ----------------------------------------
-            # TROOPS
-            # ----------------------------------------
+                clean(row.get("Role")),
 
             "infantry_level":
-                clean_string(
-                    row.get("Infa Level")
-                ),
+                clean(row.get("Infa Level")),
 
             "infantry_helios":
-                yes_no(
-                    row.get("Infa Helios?")
-                ),
+                boolean(row.get("Infa Helios?")),
 
             "lancer_level":
-                clean_string(
-                    row.get("Lancer Level")
-                ),
+                clean(row.get("Lancer Level")),
 
             "lancer_helios":
-                yes_no(
-                    row.get("Lancer Helios?")
-                ),
+                boolean(row.get("Lancer Helios?")),
 
             "marksman_level":
-                clean_string(
-                    row.get("MM Level")
-                ),
+                clean(row.get("MM Level")),
 
             "marksman_helios":
-                yes_no(
-                    row.get("MM Helios?")
-                ),
-
-            # ----------------------------------------
-            # JOINER HEROES
-            # ----------------------------------------
+                boolean(row.get("MM Helios?")),
 
             "renee":
-                yes_no(
-                    row.get("Renee")
-                ),
+                boolean(row.get("Renee")),
 
             "hendrik":
-                yes_no(
-                    row.get("Hendrik")
-                ),
+                boolean(row.get("Hendrik")),
 
             "philly":
-                yes_no(
-                    row.get("Philly")
-                ),
+                boolean(row.get("Philly")),
 
             "gatot":
-                yes_no(
-                    row.get("Gatot")
-                ),
+                boolean(row.get("Gatot")),
 
             "wu_ming":
-                yes_no(
-                    row.get("Wu Ming")
-                ),
+                boolean(row.get("Wu Ming")),
 
             "mia":
-                yes_no(
-                    row.get("Mia")
-                ),
+                boolean(row.get("Mia")),
 
             "lynn":
-                yes_no(
-                    row.get("Lynn")
-                ),
+                boolean(row.get("Lynn")),
 
             "norah":
-                yes_no(
-                    row.get("Norah")
-                ),
-
-            # ----------------------------------------
-            # AVAILABILITY
-            # ----------------------------------------
+                boolean(row.get("Norah")),
 
             "available_12_13":
-                clean_string(
-                    row.get("12-13")
-                ),
+                clean(row.get("12-13")),
 
             "available_13_14":
-                clean_string(
-                    row.get("13-14")
-                ),
+                clean(row.get("13-14")),
 
             "available_14_15":
-                clean_string(
-                    row.get("14-15")
-                ),
+                clean(row.get("14-15")),
 
             "available_15_16":
-                clean_string(
-                    row.get("15-16")
-                ),
+                clean(row.get("15-16")),
 
             "available_16_17":
-                clean_string(
-                    row.get("16-17")
-                ),
-
-            # ----------------------------------------
-            # TEAM
-            # ----------------------------------------
+                clean(row.get("16-17")),
 
             "assigned_team":
-                clean_string(
-                    row.get(
-                        "Assigned Team?"
-                    )
-                ),
+                clean(row.get("Assigned Team?")),
 
             "sheet_updated_at":
-                utc_now()
+                now(),
         }
 
-        # Last duplicate wins.
-        players[fid] = player
-
-    log(
-        f"Unique Castle players: "
-        f"{len(players)}"
-    )
-
-    log(
-        f"Duplicate Castle rows: "
-        f"{duplicates}"
-    )
+    log(f"Unique Castle players: {len(players)}")
+    log(f"Duplicate Castle rows: {duplicates}")
 
     return players
 
@@ -541,41 +273,79 @@ def load_castle_availability():
 # ROSTER DATA
 # ============================================================
 
-def load_roster_data():
-
+def load_roster():
     log("Loading roster_data")
 
-    csv_text = download_google_sheet(
-        ROSTER_GID
-    )
-
-    df = pd.read_csv(
-        StringIO(csv_text),
+    df = read_sheet(
+        ROSTER_GID,
         header=0,
-        dtype=str
     )
 
-    log(
-        f"roster_data rows read: "
-        f"{len(df)}"
-    )
+    log(f"roster_data rows read: {len(df)}")
+
+    roster = {}
+    columns = list(df.columns)
+
+    # --------------------------------------------------------
+    # Collect every Player ID / Player Name pair
+    #
+    # Pandas renames duplicate columns:
+    # Player ID
+    # Player ID.1
+    # Player ID.2
+    # --------------------------------------------------------
+
+    for index, column in enumerate(columns):
+        if not str(column).strip().startswith("Player ID"):
+            continue
+
+        if index + 1 >= len(columns):
+            continue
+
+        for _, row in df.iterrows():
+            fid = fid_value(
+                row.iloc[index]
+            )
+
+            if not fid:
+                continue
+
+            name = clean(
+                row.iloc[index + 1]
+            )
+
+            if fid not in roster:
+                roster[fid] = {
+                    "name": name,
+                    "team": None,
+                }
+
+    # --------------------------------------------------------
+    # Name -> FID
+    # --------------------------------------------------------
+
+    name_to_fid = {}
+
+    for fid, player in roster.items():
+        name = clean(player["name"])
+
+        if name:
+            name_to_fid[
+                name.casefold()
+            ] = fid
 
     # --------------------------------------------------------
     # Team columns
     # --------------------------------------------------------
 
-    team_columns = []
-
-    for column in df.columns:
-
-        name = str(column).strip()
-
-        if name.lower().endswith(
-            " team"
-        ):
-            team_columns.append(
-                column
-            )
+    team_columns = [
+        column
+        for column in df.columns
+        if str(column)
+        .strip()
+        .lower()
+        .endswith(" team")
+    ]
 
     log(
         "Team columns found: "
@@ -586,1099 +356,428 @@ def load_roster_data():
     )
 
     # --------------------------------------------------------
-    # roster_data has multiple Player ID / Player pairs.
-    #
-    # Build FID <-> player name map.
+    # Map names in each team column back to FID
     # --------------------------------------------------------
 
-    roster = {}
-
-    columns = list(df.columns)
-
-    for column_index in range(
-        len(columns)
-    ):
-
-        column_name = str(
-            columns[column_index]
-        ).strip()
-
-        if not column_name.startswith(
-            "Player ID"
-        ):
-            continue
-
-        if (
-            column_index + 1
-            >= len(columns)
-        ):
-            continue
-
-        for _, row in df.iterrows():
-
-            fid = clean_player_id(
-                row.iloc[column_index]
-            )
-
-            if not fid:
-                continue
-
-            player_name = clean_string(
-                row.iloc[
-                    column_index + 1
-                ]
-            )
-
-            if fid not in roster:
-
-                roster[fid] = {
-                    "player_name":
-                        player_name,
-
-                    "team":
-                        None
-                }
-
-            elif (
-                not roster[fid]
-                .get("player_name")
-                and player_name
-            ):
-
-                roster[fid][
-                    "player_name"
-                ] = player_name
-
-    # --------------------------------------------------------
-    # Name -> FID
-    # --------------------------------------------------------
-
-    name_to_fid = {}
-
-    for fid, info in roster.items():
-
-        player_name = clean_string(
-            info.get(
-                "player_name"
-            )
-        )
-
-        if player_name:
-
-            name_to_fid[
-                player_name.casefold()
-            ] = fid
-
-    # --------------------------------------------------------
-    # Determine team assignment
-    # --------------------------------------------------------
-
-    for team_column in team_columns:
-
-        raw_team_name = str(
-            team_column
-        ).strip()
-
-        team_name = (
-            raw_team_name
-            .replace(
-                " Team",
-                ""
-            )
+    for column in team_columns:
+        team = (
+            str(column)
+            .replace(" Team", "")
             .strip()
         )
 
-        for value in df[
-            team_column
-        ].tolist():
+        for value in df[column]:
+            name = clean(value)
 
-            player_name = clean_string(
-                value
-            )
-
-            if not player_name:
+            if not name:
                 continue
 
             fid = name_to_fid.get(
-                player_name.casefold()
+                name.casefold()
             )
 
-            if not fid:
-                continue
+            if fid:
+                roster[fid]["team"] = team
 
-            roster[fid][
-                "team"
-            ] = team_name
-
-    assigned_count = sum(
+    assigned = sum(
         1
-        for value
-        in roster.values()
-        if value.get("team")
+        for player in roster.values()
+        if player["team"]
     )
 
-    log(
-        f"Roster FIDs found: "
-        f"{len(roster)}"
-    )
-
-    log(
-        f"Roster team assignments: "
-        f"{assigned_count}"
-    )
+    log(f"Roster FIDs found: {len(roster)}")
+    log(f"Roster team assignments: {assigned}")
 
     return roster
 
 
 # ============================================================
-# WOS ORACLE
+# STATE 2348
+#
+# main.py already knows how to:
+#
+# State
+#   -> alliances
+#   -> target alliances
+#   -> alliance members
 # ============================================================
 
-def oracle_headers():
+def load_state_players():
+    log("")
+    log("========================================")
+    log("USING MAIN.PY STATE DISCOVERY")
+    log("========================================")
 
-    return {
+    discovered = discover_players()
 
-        "Authorization":
-            f"Bearer "
-            f"{WOSORACLE_API_TOKEN}",
-
-        "Accept":
-            "application/json",
-
-        "User-Agent":
-            "State2348-CastleCollector"
-    }
-
-
-def oracle_get(path):
-
-    url = (
-        WOSORACLE_BASE_URL
-        + "/"
-        + path.lstrip("/")
-    )
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            response = requests.get(
-                url,
-                headers=oracle_headers(),
-                timeout=REQUEST_TIMEOUT
-            )
-
-            # ----------------------------------------
-            # SUCCESS
-            # ----------------------------------------
-
-            if response.status_code == 200:
-
-                try:
-                    return response.json()
-
-                except Exception:
-
-                    raise RuntimeError(
-                        "WOS Oracle returned "
-                        "invalid JSON"
-                    )
-
-            # ----------------------------------------
-            # RETRYABLE
-            # ----------------------------------------
-
-            if response.status_code in {
-                408,
-                429,
-                500,
-                502,
-                503,
-                504
-            }:
-
-                wait = attempt * 5
-
-                log(
-                    "WOS Oracle temporary "
-                    f"HTTP "
-                    f"{response.status_code}"
-                )
-
-                log(
-                    f"Retrying in {wait}s..."
-                )
-
-                time.sleep(wait)
-
-                continue
-
-            # ----------------------------------------
-            # PERMANENT
-            # ----------------------------------------
-
-            raise RuntimeError(
-                "WOS Oracle error | "
-                f"HTTP "
-                f"{response.status_code} | "
-                f"{response.text[:500]}"
-            )
-
-        except requests.RequestException as exc:
-
-            if attempt >= MAX_RETRIES:
-                raise
-
-            wait = attempt * 5
-
-            log(
-                f"WOS request error: "
-                f"{exc}"
-            )
-
-            log(
-                f"Retrying in {wait}s..."
-            )
-
-            time.sleep(wait)
-
-    raise RuntimeError(
-        "WOS Oracle failed after "
-        "maximum retries"
-    )
-
-
-# ============================================================
-# EXTRACT STATE PLAYERS
-# ============================================================
-
-def extract_fid(player):
-
-    if not isinstance(
-        player,
-        dict
-    ):
-        return None
-
-    possibilities = [
-        player.get("fid"),
-        player.get("player_id"),
-        player.get("playerId")
-    ]
-
-    for value in possibilities:
-
-        fid = clean_player_id(
-            value
+    if not discovered:
+        raise RuntimeError(
+            "discover_players() returned zero players"
         )
-
-        if fid:
-            return fid
-
-    return None
-
-
-def recursively_find_players(data):
-
-    found = []
-
-    if isinstance(data, list):
-
-        for item in data:
-
-            if isinstance(
-                item,
-                dict
-            ):
-
-                fid = extract_fid(
-                    item
-                )
-
-                if fid:
-                    found.append(
-                        item
-                    )
-
-                found.extend(
-                    recursively_find_players(
-                        item
-                    )
-                )
-
-    elif isinstance(
-        data,
-        dict
-    ):
-
-        for value in data.values():
-
-            found.extend(
-                recursively_find_players(
-                    value
-                )
-            )
-
-    return found
-
-
-def get_state_players():
-
-    log(
-        "Fetching State "
-        f"{STATE_ID} "
-        "from WOS Oracle"
-    )
-
-    data = oracle_get(
-        f"/api/v1/states/{STATE_ID}"
-    )
-
-    raw_players = (
-        recursively_find_players(
-            data
-        )
-    )
 
     players = {}
 
-    for player in raw_players:
-
-        fid = extract_fid(
-            player
+    for player in discovered:
+        fid = fid_value(
+            player.get("fid")
         )
 
         if not fid:
             continue
 
-        existing = players.get(
-            fid
-        )
-
-        # If duplicate versions exist,
-        # keep the richer object.
-        if (
-            existing is None
-            or len(player)
-            > len(existing)
-        ):
-
-            players[fid] = player
+        players[fid] = {
+            "player_id": fid,
+            "name": clean(
+                player.get("name")
+            ),
+            "alliance": clean(
+                player.get("alliance")
+            ),
+            "power": integer(
+                player.get("power")
+            ),
+            "furnace_level": integer(
+                player.get("furnace_level")
+            ),
+        }
 
     log(
-        f"State {STATE_ID} "
-        f"Oracle players found: "
+        f"Current target-alliance players: "
         f"{len(players)}"
     )
 
-    # IMPORTANT:
-    #
-    # Never continue with zero players.
-    # Otherwise an Oracle/API problem could
-    # cause us to treat every Castle player
-    # as transferred out.
     if not players:
-
         raise RuntimeError(
-            "WOS Oracle returned ZERO "
-            f"players for State {STATE_ID}. "
-            "Sync aborted for safety."
+            "State player map is empty"
         )
 
     return players
 
 
 # ============================================================
-# WOS FIELD HELPERS
+# MERGE
 # ============================================================
 
-def oracle_player_name(player):
-
-    if not player:
-        return None
-
-    for key in [
-        "player_name",
-        "name",
-        "nickname"
-    ]:
-
-        value = clean_string(
-            player.get(key)
-        )
-
-        if value:
-            return value
-
-    return None
-
-
-def oracle_alliance(player):
-
-    if not player:
-        return None
-
-    possibilities = [
-
-        player.get("alliance"),
-
-        player.get(
-            "alliance_name"
-        ),
-
-        player.get(
-            "allianceName"
-        ),
-
-        player.get(
-            "alliance_abbreviation"
-        )
-    ]
-
-    for value in possibilities:
-
-        if isinstance(
-            value,
-            dict
-        ):
-
-            for key in [
-                "name",
-                "abbreviation",
-                "tag"
-            ]:
-
-                result = clean_string(
-                    value.get(key)
-                )
-
-                if result:
-                    return result
-
-        else:
-
-            result = clean_string(
-                value
-            )
-
-            if result:
-                return result
-
-    return None
-
-
-def oracle_furnace_level(player):
-
-    if not player:
-        return None
-
-    for key in [
-        "furnace_level",
-        "furnaceLevel",
-        "furnace"
-    ]:
-
-        value = clean_integer(
-            player.get(key)
-        )
-
-        if value is not None:
-            return value
-
-    return None
-
-
-def oracle_total_power(player):
-
-    if not player:
-        return None
-
-    for key in [
-        "total_power",
-        "totalPower",
-        "power"
-    ]:
-
-        value = clean_integer(
-            player.get(key)
-        )
-
-        if value is not None:
-            return value
-
-    return None
-
-
-# ============================================================
-# MERGE DATA
-# ============================================================
-
-def merge_castle_data(
+def merge_data(
     availability,
     roster,
-    state_players
+    state_players,
 ):
+    log("")
+    log("========================================")
+    log("COMPARING CASTLE REGISTRATIONS")
+    log("========================================")
 
-    log(
-        "Comparing Castle registrations "
-        "against State 2348"
-    )
+    rows = []
+    missing = []
 
-    output = []
+    timestamp = now()
 
-    missing_from_state = []
-
-    name_changes = []
-    alliance_changes = []
-
-    checked_at = utc_now()
-
-    for fid, sheet_player in (
-        availability.items()
-    ):
-
-        oracle_player = (
-            state_players.get(fid)
-        )
+    for fid, sheet in availability.items():
+        current = state_players.get(fid)
 
         # ----------------------------------------------------
-        # PLAYER NOT FOUND IN CURRENT STATE DATA
-        #
-        # Do NOT write them into the current castle table.
+        # Player isn't currently in one of our State 2348
+        # target alliances.
         # ----------------------------------------------------
 
-        if oracle_player is None:
-
-            missing_from_state.append(
-                {
-                    "fid": fid,
-                    "name":
-                        sheet_player.get(
-                            "sheet_player_name"
-                        )
-                }
-            )
+        if not current:
+            missing.append(fid)
 
             log(
-                "NOT IN CURRENT STATE DATA | "
-                f"{fid} | "
-                f"{sheet_player.get('sheet_player_name')}"
+                f"NOT FOUND | {fid} | "
+                f"{sheet['sheet_player_name']}"
             )
 
             continue
 
-        # ----------------------------------------------------
-        # START WITH SHEET DATA
-        # ----------------------------------------------------
+        row = dict(sheet)
 
-        record = dict(
-            sheet_player
-        )
-
-        # ----------------------------------------------------
-        # ROSTER DATA
-        # ----------------------------------------------------
-
-        roster_info = roster.get(
+        roster_player = roster.get(
             fid,
             {}
         )
 
-        record[
-            "roster_team"
-        ] = clean_string(
-            roster_info.get(
-                "team"
+        row["roster_team"] = clean(
+            roster_player.get("team")
+        )
+
+        # ----------------------------------------------------
+        # Current WOS data
+        # ----------------------------------------------------
+
+        row["player_name"] = (
+            current["name"]
+            or row["sheet_player_name"]
+        )
+
+        row["alliance"] = (
+            current["alliance"]
+            or row["sheet_alliance"]
+        )
+
+        row["furnace_level"] = (
+            current["furnace_level"]
+        )
+
+        row["total_power"] = (
+            current["power"]
+        )
+
+        # ----------------------------------------------------
+        # Changes
+        # ----------------------------------------------------
+
+        row["name_changed"] = (
+            bool(current["name"])
+            and not same(
+                current["name"],
+                row["sheet_player_name"],
+            )
+        )
+
+        row["alliance_changed"] = (
+            bool(current["alliance"])
+            and not same(
+                current["alliance"],
+                row["sheet_alliance"],
             )
         )
 
         # ----------------------------------------------------
-        # CURRENT ORACLE DATA
+        # Team status
         # ----------------------------------------------------
 
-        current_name = (
-            oracle_player_name(
-                oracle_player
-            )
+        role = clean(
+            row["role"]
         )
 
-        current_alliance = (
-            oracle_alliance(
-                oracle_player
-            )
+        assigned = clean(
+            row["assigned_team"]
         )
 
-        furnace_level = (
-            oracle_furnace_level(
-                oracle_player
-            )
+        roster_team = clean(
+            row["roster_team"]
         )
 
-        total_power = (
-            oracle_total_power(
-                oracle_player
-            )
+        is_lead = (
+            role
+            and role.casefold() == "lead"
         )
 
-        record[
-            "player_name"
-        ] = (
-            current_name
-            or record.get(
-                "sheet_player_name"
-            )
-        )
-
-        record[
-            "alliance"
-        ] = (
-            current_alliance
-            or record.get(
-                "sheet_alliance"
-            )
-        )
-
-        record[
-            "furnace_level"
-        ] = furnace_level
-
-        record[
-            "total_power"
-        ] = total_power
-
-        # ----------------------------------------------------
-        # NAME CHANGE
-        # ----------------------------------------------------
-
-        name_changed = False
-
-        if (
-            current_name
-            and record.get(
-                "sheet_player_name"
-            )
-        ):
-
-            name_changed = (
-                not same_text(
-                    current_name,
-                    record[
-                        "sheet_player_name"
-                    ]
-                )
-            )
-
-        record[
-            "name_changed"
-        ] = name_changed
-
-        if name_changed:
-
-            name_changes.append(
-                (
-                    fid,
-                    record[
-                        "sheet_player_name"
-                    ],
-                    current_name
-                )
-            )
-
-        # ----------------------------------------------------
-        # ALLIANCE CHANGE
-        # ----------------------------------------------------
-
-        alliance_changed = False
-
-        if (
-            current_alliance
-            and record.get(
-                "sheet_alliance"
-            )
-        ):
-
-            alliance_changed = (
-                not same_text(
-                    current_alliance,
-                    record[
-                        "sheet_alliance"
-                    ]
-                )
-            )
-
-        record[
-            "alliance_changed"
-        ] = alliance_changed
-
-        if alliance_changed:
-
-            alliance_changes.append(
-                (
-                    fid,
-                    record[
-                        "sheet_alliance"
-                    ],
-                    current_alliance
-                )
-            )
-
-        # ----------------------------------------------------
-        # NEEDS TEAM
-        # ----------------------------------------------------
-
-        assigned_team = clean_string(
-            record.get(
-                "assigned_team"
-            )
-        )
-
-        roster_team = clean_string(
-            record.get(
-                "roster_team"
-            )
-        )
-
-        role = clean_string(
-            record.get(
-                "role"
-            )
-        )
-
-        role_is_lead = (
-            role is not None
-            and role.casefold()
-            == "lead"
-        )
-
-        sheet_says_needs_team = (
-            assigned_team is None
-            or assigned_team.casefold()
+        sheet_needs_team = (
+            not assigned
+            or assigned.casefold()
             == "needs team"
         )
 
-        record[
-            "needs_team"
-        ] = (
-            not role_is_lead
-            and sheet_says_needs_team
-            and roster_team is None
+        row["needs_team"] = bool(
+            not is_lead
+            and sheet_needs_team
+            and not roster_team
         )
 
-        # ----------------------------------------------------
-        # TIMESTAMPS
-        # ----------------------------------------------------
-
-        record[
-            "oracle_updated_at"
-        ] = checked_at
-
-        record[
-            "database_updated_at"
-        ] = checked_at
-
-        output.append(
-            record
+        row["oracle_updated_at"] = (
+            timestamp
         )
 
+        row["database_updated_at"] = (
+            timestamp
+        )
+
+        rows.append(row)
+
     # --------------------------------------------------------
-    # SUMMARY
+    # Safety
     # --------------------------------------------------------
 
-    log(
-        "--------------------------------"
+    match_rate = (
+        len(rows)
+        / len(availability)
+        if availability
+        else 0
     )
 
+    log("")
+    log("========================================")
+    log("COMPARISON SUMMARY")
+    log("========================================")
+
     log(
-        f"Registered players: "
+        f"Castle registrations: "
         f"{len(availability)}"
     )
 
     log(
-        f"Matched to State 2348: "
-        f"{len(output)}"
+        f"Matched: {len(rows)}"
     )
 
     log(
-        f"Not found in State 2348: "
-        f"{len(missing_from_state)}"
+        f"Not found: {len(missing)}"
     )
 
     log(
-        f"Name changes: "
-        f"{len(name_changes)}"
+        f"Match rate: {match_rate:.1%}"
     )
 
-    log(
-        f"Alliance changes: "
-        f"{len(alliance_changes)}"
-    )
-
-    return output
-
-
-# ============================================================
-# SUPABASE
-# ============================================================
-
-def supabase_headers(
-    prefer=None
-):
-
-    headers = {
-
-        "apikey":
-            SUPABASE_KEY,
-
-        "Authorization":
-            f"Bearer {SUPABASE_KEY}",
-
-        "Content-Type":
-            "application/json"
-    }
-
-    if prefer:
-
-        headers[
-            "Prefer"
-        ] = prefer
-
-    return headers
-
-
-def supabase_request(
-    method,
-    url,
-    **kwargs
-):
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            response = requests.request(
-                method,
-                url,
-                timeout=REQUEST_TIMEOUT,
-                **kwargs
-            )
-
-            if response.status_code in {
-                200,
-                201,
-                204
-            }:
-
-                return response
-
-            if response.status_code in {
-                408,
-                429,
-                500,
-                502,
-                503,
-                504
-            }:
-
-                wait = attempt * 5
-
-                log(
-                    "Supabase temporary "
-                    f"HTTP "
-                    f"{response.status_code}"
-                )
-
-                time.sleep(wait)
-
-                continue
-
-            raise RuntimeError(
-                "SUPABASE ERROR | "
-                f"HTTP "
-                f"{response.status_code}\n"
-                f"{response.text}"
-            )
-
-        except requests.RequestException:
-
-            if attempt >= MAX_RETRIES:
-                raise
-
-            time.sleep(
-                attempt * 5
-            )
-
-    raise RuntimeError(
-        "Supabase request failed"
-    )
-
-
-# ============================================================
-# UPSERT
-# ============================================================
-
-def upsert_castle_players(
-    players
-):
-
-    if not players:
-
+    if match_rate < 0.50:
         raise RuntimeError(
-            "No Castle players to upsert"
+            "Less than 50% of Castle players "
+            "matched current State data. "
+            "Supabase update aborted."
         )
 
-    log(
-        f"Upserting {len(players)} "
-        f"players into "
-        f"{SUPABASE_TABLE}"
+    return rows
+
+
+# ============================================================
+# SUPABASE UPSERT
+# ============================================================
+
+def upsert_players(rows):
+    if not rows:
+        raise RuntimeError(
+            "No Castle rows to write"
+        )
+
+    endpoint = (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/{SUPABASE_TABLE}"
+        f"?on_conflict=player_id"
     )
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/"
-        f"{SUPABASE_TABLE}"
-        "?on_conflict=player_id"
-    )
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization":
+            f"Bearer {SUPABASE_KEY}",
+        "Content-Type":
+            "application/json",
+        "Prefer":
+            "resolution=merge-duplicates,"
+            "return=minimal",
+    }
 
-    total_written = 0
+    total = 0
 
     for start in range(
         0,
-        len(players),
-        UPSERT_BATCH_SIZE
+        len(rows),
+        BATCH_SIZE,
     ):
-
-        batch = players[
+        batch = rows[
             start:
-            start + UPSERT_BATCH_SIZE
+            start + BATCH_SIZE
         ]
 
-        supabase_request(
-
-            "POST",
-
-            url,
-
-            headers=supabase_headers(
-                "resolution=merge-duplicates,"
-                "return=minimal"
-            ),
-
-            json=batch
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=batch,
+            timeout=60,
         )
 
-        total_written += len(
-            batch
-        )
+        if not (
+            200
+            <= response.status_code
+            < 300
+        ):
+            raise RuntimeError(
+                "SUPABASE ERROR | "
+                f"HTTP {response.status_code}\n"
+                f"{response.text}"
+            )
+
+        total += len(batch)
 
         log(
-            f"Supabase upsert: "
-            f"{total_written}/"
-            f"{len(players)}"
+            f"Supabase: "
+            f"{total}/{len(rows)} saved"
         )
 
-    return total_written
+    return total
 
 
 # ============================================================
-# REMOVE STALE DATABASE PLAYERS
+# DELETE STALE CASTLE RECORDS
 # ============================================================
 
-def get_existing_castle_fids():
-
-    url = (
-        f"{SUPABASE_URL}/rest/v1/"
-        f"{SUPABASE_TABLE}"
-        "?select=player_id"
-    )
-
-    response = supabase_request(
-
-        "GET",
-
-        url,
-
-        headers=supabase_headers()
-    )
-
-    data = response.json()
-
-    fids = set()
-
-    for row in data:
-
-        fid = clean_player_id(
-            row.get(
-                "player_id"
-            )
-        )
-
-        if fid:
-            fids.add(fid)
-
-    return fids
-
-
-def delete_stale_players(
-    current_players
-):
-
-    current_fids = {
-        int(
-            player["player_id"]
-        )
-        for player
-        in current_players
+def delete_stale(current_rows):
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization":
+            f"Bearer {SUPABASE_KEY}",
     }
 
-    existing_fids = (
-        get_existing_castle_fids()
+    endpoint = (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/{SUPABASE_TABLE}"
+        f"?select=player_id"
     )
 
-    stale_fids = (
-        existing_fids
-        -
-        current_fids
+    response = requests.get(
+        endpoint,
+        headers=headers,
+        timeout=60,
     )
 
-    if not stale_fids:
-
-        log(
-            "No stale Castle records"
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Could not read existing "
+            "castle_players records | "
+            f"HTTP {response.status_code} | "
+            f"{response.text}"
         )
 
+    existing = {
+        fid_value(row.get("player_id"))
+        for row in response.json()
+        if fid_value(
+            row.get("player_id")
+        )
+    }
+
+    current = {
+        row["player_id"]
+        for row in current_rows
+    }
+
+    stale = existing - current
+
+    if not stale:
+        log(
+            "No stale Castle records."
+        )
         return 0
 
     log(
-        f"Stale records found: "
-        f"{len(stale_fids)}"
+        f"Stale records: {len(stale)}"
     )
 
     deleted = 0
 
-    for fid in stale_fids:
-
-        url = (
+    for fid in stale:
+        endpoint = (
             f"{SUPABASE_URL}"
-            f"/rest/v1/"
-            f"{SUPABASE_TABLE}"
+            f"/rest/v1/{SUPABASE_TABLE}"
             f"?player_id=eq.{fid}"
         )
 
-        supabase_request(
-
-            "DELETE",
-
-            url,
-
-            headers=supabase_headers(
-                "return=minimal"
-            )
+        response = requests.delete(
+            endpoint,
+            headers=headers,
+            timeout=60,
         )
+
+        if not (
+            200
+            <= response.status_code
+            < 300
+        ):
+            raise RuntimeError(
+                f"Failed deleting {fid} | "
+                f"HTTP {response.status_code} | "
+                f"{response.text}"
+            )
 
         log(
             f"STALE DELETE | {fid}"
@@ -1690,297 +789,57 @@ def delete_stale_players(
 
 
 # ============================================================
-# DISPLAY SUMMARY
-# ============================================================
-
-def display_summary(
-    players
-):
-
-    by_alliance = {}
-    by_team = {}
-
-    needs_team = []
-
-    for player in players:
-
-        alliance = (
-            clean_string(
-                player.get(
-                    "alliance"
-                )
-            )
-            or "Unknown"
-        )
-
-        by_alliance[
-            alliance
-        ] = (
-            by_alliance.get(
-                alliance,
-                0
-            )
-            + 1
-        )
-
-        team = (
-            clean_string(
-                player.get(
-                    "roster_team"
-                )
-            )
-            or clean_string(
-                player.get(
-                    "assigned_team"
-                )
-            )
-            or "Unassigned"
-        )
-
-        by_team[
-            team
-        ] = (
-            by_team.get(
-                team,
-                0
-            )
-            + 1
-        )
-
-        if player.get(
-            "needs_team"
-        ):
-
-            needs_team.append(
-                player
-            )
-
-    log("")
-    log("========== ALLIANCES ==========")
-
-    for alliance in sorted(
-        by_alliance
-    ):
-
-        log(
-            f"{alliance}: "
-            f"{by_alliance[alliance]}"
-        )
-
-    log("")
-    log("============ TEAMS ============")
-
-    for team in sorted(
-        by_team
-    ):
-
-        log(
-            f"{team}: "
-            f"{by_team[team]}"
-        )
-
-    log("")
-    log("========== NEEDS TEAM =========")
-
-    for player in needs_team:
-
-        log(
-            f"{player['player_id']} | "
-            f"{player.get('player_name')} | "
-            f"{player.get('alliance')}"
-        )
-
-    log(
-        f"Total needing team: "
-        f"{len(needs_team)}"
-    )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    log("========================================")
+    log("STATE 2348 CASTLE COLLECTOR")
+    log("========================================")
 
-    log(
-        "========================================"
-    )
-
-    log(
-        "STATE 2348 CASTLE COLLECTOR"
-    )
-
-    log(
-        "========================================"
-    )
-
-    # --------------------------------------------------------
-    # Validate secrets
-    # --------------------------------------------------------
-
-    validate_environment()
-
-    # --------------------------------------------------------
-    # Google Sheet
-    # --------------------------------------------------------
-
-    availability = (
-        load_castle_availability()
-    )
-
-    roster = (
-        load_roster_data()
-    )
+    # Google Sheets
+    availability = load_availability()
+    roster = load_roster()
 
     if not availability:
-
         raise RuntimeError(
-            "Castle Availability returned "
-            "zero valid players. "
-            "Aborting for safety."
+            "No Castle registrations found"
         )
 
-    # --------------------------------------------------------
-    # WOS Oracle
-    # --------------------------------------------------------
-
+    # WOS Oracle via existing main.py
     state_players = (
-        get_state_players()
+        load_state_players()
     )
 
-    # --------------------------------------------------------
     # Merge
-    # --------------------------------------------------------
-
-    castle_players = (
-        merge_castle_data(
-            availability,
-            roster,
-            state_players
-        )
+    rows = merge_data(
+        availability,
+        roster,
+        state_players,
     )
 
-    if not castle_players:
-
-        raise RuntimeError(
-            "ZERO Castle players matched "
-            "State 2348. "
-            "Aborting for safety."
-        )
-
-    # Extra safety:
-    #
-    # If almost everybody suddenly disappears,
-    # don't destroy the Supabase table.
-    match_ratio = (
-        len(castle_players)
-        /
-        len(availability)
+    # Write first
+    written = upsert_players(
+        rows
     )
 
-    log(
-        f"State match rate: "
-        f"{match_ratio:.1%}"
+    # Only delete stale rows AFTER the entire
+    # discovery/merge/upsert succeeds.
+    deleted = delete_stale(
+        rows
     )
-
-    if match_ratio < 0.50:
-
-        raise RuntimeError(
-            "Less than 50% of registered "
-            "players matched State 2348. "
-            "This probably indicates an "
-            "Oracle/API parsing problem. "
-            "Database update aborted."
-        )
-
-    # --------------------------------------------------------
-    # Display what we're about to write
-    # --------------------------------------------------------
-
-    display_summary(
-        castle_players
-    )
-
-    # --------------------------------------------------------
-    # Supabase upsert
-    # --------------------------------------------------------
-
-    written = (
-        upsert_castle_players(
-            castle_players
-        )
-    )
-
-    # --------------------------------------------------------
-    # Remove stale records
-    #
-    # Only happens AFTER:
-    #
-    # Google Sheet succeeded
-    # Oracle succeeded
-    # match safety succeeded
-    # Supabase upsert succeeded
-    # --------------------------------------------------------
-
-    deleted = (
-        delete_stale_players(
-            castle_players
-        )
-    )
-
-    # --------------------------------------------------------
-    # DONE
-    # --------------------------------------------------------
 
     log("")
-    log(
-        "========================================"
-    )
-
-    log(
-        "CASTLE SYNC COMPLETE"
-    )
-
+    log("========================================")
+    log("CASTLE SYNC COMPLETE")
+    log("========================================")
     log(
         f"Players written: {written}"
     )
-
     log(
-        f"Stale records removed: {deleted}"
+        f"Stale records deleted: {deleted}"
     )
 
-    log(
-        "========================================"
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        main()
-
-    except Exception as exc:
-
-        log("")
-        log(
-            "========================================"
-        )
-
-        log(
-            "CASTLE SYNC FAILED"
-        )
-
-        log(
-            "========================================"
-        )
-
-        log(
-            str(exc)
-        )
-
-        raise
+    main()
