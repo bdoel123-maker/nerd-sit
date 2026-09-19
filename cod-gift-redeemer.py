@@ -21,7 +21,6 @@ import hashlib
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -79,10 +78,7 @@ WOS_ENCRYPT_KEY = (
 # PUBLIC CODE SOURCE
 # ------------------------------------------------------------
 
-CODE_SOURCE_URL = (
-    "https://www.whiteoutsurvival-community.com/"
-    "en/gift-codes.html"
-)
+CODE_SOURCE_URL = "https://wosoracle.com/api/codes"
 
 
 # ------------------------------------------------------------
@@ -215,7 +211,7 @@ def discord_message(content):
 def discover_gift_codes():
 
     log(
-        "Checking public WOS gift-code source..."
+        "Checking WOS Oracle for active gift codes..."
     )
 
     try:
@@ -223,93 +219,67 @@ def discover_gift_codes():
         response = requests.get(
             CODE_SOURCE_URL,
             headers={
-                "User-Agent":
-                    (
-                        "Mozilla/5.0 "
-                        "(Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) "
-                        "Chrome/153.0 Safari/537.36"
-                    )
+                "Accept": "application/json",
+                "User-Agent": "COD-Gift-Code-Redeemer/1.0",
             },
             timeout=30
         )
 
         response.raise_for_status()
 
-    except Exception as exc:
+        data = response.json()
+
+    except requests.RequestException as exc:
 
         log(
-            f"Gift-code discovery failed: {exc}"
+            f"WOS Oracle gift-code request failed: {exc}"
+        )
+
+        return []
+
+    except ValueError as exc:
+
+        log(
+            f"WOS Oracle returned invalid JSON: {exc}"
         )
 
         return []
 
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
+    if not isinstance(data, list):
 
-
-    discovered = []
-
-
-    # --------------------------------------------------------
-    # PRIMARY METHOD
-    #
-    # WSCO currently presents gift codes inside code elements.
-    # --------------------------------------------------------
-
-    for element in soup.find_all("code"):
-
-        value = element.get_text(
-            strip=True
+        log(
+            "Unexpected WOS Oracle response format. "
+            "Expected a list."
         )
 
-        if is_possible_code(value):
-
-            discovered.append(
-                value
-            )
+        return []
 
 
-    # --------------------------------------------------------
-    # FALLBACK
-    #
-    # Look for gift-code card text if site HTML changes slightly.
-    # --------------------------------------------------------
-
-    if not discovered:
-
-        text = soup.get_text(
-            "\n",
-            strip=True
-        )
-
-        matches = re.findall(
-            r"Gift code\s+([A-Za-z0-9_-]{4,40})",
-            text,
-            flags=re.IGNORECASE
-        )
-
-        discovered.extend(
-            matches
-        )
-
-
-    # --------------------------------------------------------
-    # DEDUPLICATE
-    # --------------------------------------------------------
-
-    clean_codes = []
+    active_codes = []
 
     seen = set()
 
 
-    for code in discovered:
+    for item in data:
 
-        code = code.strip()
+        if not isinstance(item, dict):
+            continue
+
+        code = item.get("Code")
+
+        is_active = item.get("IsActive", False)
+
+        if not code:
+            continue
+
+        if is_active is not True:
+            continue
+
+        code = str(code).strip()
+
+        if not is_possible_code(code):
+            continue
 
         key = code.lower()
 
@@ -318,25 +288,23 @@ def discover_gift_codes():
 
         seen.add(key)
 
-        clean_codes.append(
-            code
-        )
+        active_codes.append(code)
 
 
     log(
-        f"Discovered {len(clean_codes)} "
-        "public gift code(s)."
+        f"WOS Oracle returned "
+        f"{len(active_codes)} active gift code(s)."
     )
 
 
-    for code in clean_codes:
+    for code in active_codes:
 
         log(
-            f"  Gift code: {code}"
+            f"  Active gift code: {code}"
         )
 
 
-    return clean_codes
+    return active_codes
 
 
 def is_possible_code(value):
@@ -1587,7 +1555,7 @@ def get_codes_to_process():
     if not discovered:
 
         log(
-            "No public gift codes discovered."
+            "No active gift codes discovered from WOS Oracle."
         )
 
         return []
