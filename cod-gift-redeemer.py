@@ -1,3 +1,19 @@
+# ============================================================
+# COD AUTOMATIC WOS GIFT CODE REDEEMER
+# State 2348
+#
+# Flow:
+#   1. Discover active public WOS gift codes
+#   2. Save new codes to Supabase
+#   3. Load active COD players
+#   4. Redeem codes
+#   5. Save individual results
+#   6. Update gift-code totals
+#   7. Post Discord webhook summary
+#
+# Designed for GitHub Actions every 6 hours.
+# ============================================================
+
 import os
 import re
 import time
@@ -5,36 +21,83 @@ import hashlib
 from datetime import datetime, timezone
 
 import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from supabase import create_client
+
+
+# ============================================================
+# LOAD ENVIRONMENT
+# ============================================================
+
+load_dotenv()
+
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+
+
+if not SUPABASE_URL:
+    raise RuntimeError("SUPABASE_URL is missing.")
+
+if not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_KEY is missing.")
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-
 ALLIANCE = "COD"
 
-GIFT_CODE_SOURCE = (
-    "https://www.whiteoutsurvival-community.com/en/gift-codes.html"
+DEFAULT_STATE = 2348
+
+
+# ------------------------------------------------------------
+# WOS API
+# ------------------------------------------------------------
+
+WOS_BASE_URL = (
+    "https://wos-giftcode-api.centurygame.com"
 )
 
-WOS_BASE_URL = "https://wos-giftcode-api.centurygame.com"
-WOS_REDEEM_URL = WOS_BASE_URL + "/api/gift_code"
-WOS_ORIGIN = "https://wos-giftcode.centurygame.com"
+WOS_REDEEM_URL = (
+    WOS_BASE_URL + "/api/gift_code"
+)
 
-WOS_ENCRYPT_KEY = "tB87#kPtkxqOS2"
+WOS_ORIGIN = (
+    "https://wos-giftcode.centurygame.com"
+)
+
+WOS_ENCRYPT_KEY = (
+    "tB87#kPtkxqOS2"
+)
+
+
+# ------------------------------------------------------------
+# PUBLIC CODE SOURCE
+# ------------------------------------------------------------
+
+CODE_SOURCE_URL = (
+    "https://www.whiteoutsurvival-community.com/"
+    "en/gift-codes.html"
+)
+
+
+# ------------------------------------------------------------
+# TIMING
+# ------------------------------------------------------------
 
 PLAYER_DELAY = 1.25
 
 TRANSPORT_RETRIES = 3
-FID_RETRIES = 3
 
-TOO_FREQUENT_DELAY = 60
-MAX_COOLDOWNS = 3
+TRANSPORT_RETRY_DELAY = 3
+
+RATE_LIMIT_WAIT = 60
+
+MAX_RATE_LIMIT_RETRIES = 3
 
 
 # ============================================================
@@ -48,12 +111,52 @@ supabase = create_client(
 
 
 # ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+
+session.headers.update({
+
+    "accept":
+        "application/json, text/plain, */*",
+
+    "accept-language":
+        "en-US,en;q=0.9",
+
+    "content-type":
+        "application/x-www-form-urlencoded",
+
+    "origin":
+        WOS_ORIGIN,
+
+    "referer":
+        WOS_ORIGIN + "/",
+
+    "user-agent":
+        (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/153.0.0.0 "
+            "Safari/537.36"
+        ),
+
+})
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 
 def log(message):
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
     )
 
     print(
@@ -69,10 +172,12 @@ def log(message):
 def discord_message(content):
 
     if not DISCORD_WEBHOOK_URL:
+
         log(
             "DISCORD_WEBHOOK_URL not configured. "
             "Skipping Discord message."
         )
+
         return
 
     try:
@@ -80,7 +185,6 @@ def discord_message(content):
         response = requests.post(
             DISCORD_WEBHOOK_URL,
             json={
-                "username": "COD Gift Codes",
                 "content": content
             },
             timeout=20
@@ -90,9 +194,10 @@ def discord_message(content):
             200,
             204
         ):
+
             log(
-                "Discord webhook error: "
-                f"{response.status_code} "
+                "Discord webhook error "
+                f"{response.status_code}: "
                 f"{response.text[:200]}"
             )
 
@@ -104,28 +209,29 @@ def discord_message(content):
 
 
 # ============================================================
-# DISCOVER ACTIVE GIFT CODES
+# GIFT CODE DISCOVERY
 # ============================================================
 
 def discover_gift_codes():
 
-    log("Checking for active WOS gift codes...")
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/135.0 Safari/537.36"
-        )
-    }
+    log(
+        "Checking public WOS gift-code source..."
+    )
 
     try:
 
         response = requests.get(
-            GIFT_CODE_SOURCE,
-            headers=headers,
+            CODE_SOURCE_URL,
+            headers={
+                "User-Agent":
+                    (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) "
+                        "Chrome/153.0 Safari/537.36"
+                    )
+            },
             timeout=30
         )
 
@@ -139,136 +245,143 @@ def discover_gift_codes():
 
         return []
 
-    html = response.text
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser"
+    )
+
+
+    discovered = []
 
 
     # --------------------------------------------------------
-    # Isolate active gift-code section when possible
+    # PRIMARY METHOD
+    #
+    # WSCO currently presents gift codes inside code elements.
     # --------------------------------------------------------
 
-    active_section = html
+    for element in soup.find_all("code"):
 
-    active_markers = [
-        "Active gift codes",
-        "Active Gift Codes",
-        "active gift codes"
-    ]
+        value = element.get_text(
+            strip=True
+        )
 
-    for marker in active_markers:
+        if is_possible_code(value):
 
-        position = html.find(marker)
-
-        if position >= 0:
-
-            active_section = html[
-                position:
-                position + 50000
-            ]
-
-            break
+            discovered.append(
+                value
+            )
 
 
     # --------------------------------------------------------
-    # WSCO gift-code pages contain code values in several
-    # HTML structures. Extract likely values.
+    # FALLBACK
+    #
+    # Look for gift-code card text if site HTML changes slightly.
     # --------------------------------------------------------
 
-    candidates = set()
+    if not discovered:
 
-
-    patterns = [
-
-        r'data-code=["\']([^"\']+)["\']',
-
-        r'data-giftcode=["\']([^"\']+)["\']',
-
-        r'<code[^>]*>\s*([^<\s]+)\s*</code>',
-
-        r'Gift\s*[Cc]ode[^A-Za-z0-9]{0,100}'
-        r'([A-Za-z0-9]{5,30})',
-
-        r'Code:\s*</?[^>]*>?\s*'
-        r'([A-Za-z0-9]{5,30})'
-    ]
-
-
-    for pattern in patterns:
+        text = soup.get_text(
+            "\n",
+            strip=True
+        )
 
         matches = re.findall(
-            pattern,
-            active_section,
+            r"Gift code\s+([A-Za-z0-9_-]{4,40})",
+            text,
             flags=re.IGNORECASE
         )
 
-        for value in matches:
-
-            code = str(value).strip()
-
-            if valid_code_candidate(code):
-                candidates.add(code)
+        discovered.extend(
+            matches
+        )
 
 
-    codes = sorted(candidates)
+    # --------------------------------------------------------
+    # DEDUPLICATE
+    # --------------------------------------------------------
+
+    clean_codes = []
+
+    seen = set()
+
+
+    for code in discovered:
+
+        code = code.strip()
+
+        key = code.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        clean_codes.append(
+            code
+        )
+
 
     log(
-        f"Discovered {len(codes)} "
-        "possible active gift code(s)."
+        f"Discovered {len(clean_codes)} "
+        "public gift code(s)."
     )
 
-    for code in codes:
-        log(f"  Gift code: {code}")
 
-    return codes
+    for code in clean_codes:
+
+        log(
+            f"  Gift code: {code}"
+        )
 
 
-def valid_code_candidate(code):
+    return clean_codes
 
-    if not code:
+
+def is_possible_code(value):
+
+    if not value:
         return False
 
-    if len(code) < 5:
+    if len(value) < 4:
         return False
 
-    if len(code) > 30:
+    if len(value) > 40:
         return False
 
     if not re.fullmatch(
-        r"[A-Za-z0-9]+",
-        code
+        r"[A-Za-z0-9_-]+",
+        value
     ):
         return False
 
 
     blocked = {
+        "android",
+        "ios",
         "discord",
-        "facebook",
-        "youtube",
-        "instagram",
-        "twitter",
-        "whatsapp",
-        "telegram",
         "copy",
         "redeem",
-        "active",
-        "expired",
         "giftcode",
-        "whiteout",
-        "survival"
+        "giftcodes",
     }
 
-    if code.lower() in blocked:
+
+    if value.lower() in blocked:
         return False
+
 
     return True
 
 
 # ============================================================
-# GIFT CODE DATABASE
+# SUPABASE - GIFT CODES
 # ============================================================
 
-def get_gift_code(code):
+def get_existing_code(code):
 
-    result = (
+    response = (
         supabase
         .table("gift_codes")
         .select("*")
@@ -277,8 +390,11 @@ def get_gift_code(code):
         .execute()
     )
 
-    if result.data:
-        return result.data[0]
+
+    if response.data:
+
+        return response.data[0]
+
 
     return None
 
@@ -290,51 +406,52 @@ def create_gift_code(code):
         f"{code} to Supabase..."
     )
 
-    result = (
+
+    response = (
         supabase
         .table("gift_codes")
         .insert({
-            "code": code,
-            "status": "pending",
-            "submitted_by": "auto-discovery"
+
+            "code":
+                code,
+
+            "status":
+                "pending",
+
+            "submitted_by":
+                "automatic",
+
+            "submitted_by_id":
+                "github-actions",
+
         })
         .execute()
     )
 
-    if not result.data:
+
+    if not response.data:
+
         raise RuntimeError(
             f"Could not create gift code {code}"
         )
 
-    return result.data[0]
 
-
-def update_gift_code(
-    gift_id,
-    **values
-):
-
-    (
-        supabase
-        .table("gift_codes")
-        .update(values)
-        .eq("id", gift_id)
-        .execute()
-    )
+    return response.data[0]
 
 
 # ============================================================
 # LOAD COD PLAYERS
 # ============================================================
 
-def load_cod_players():
+def get_cod_players():
 
     log(
         "Loading active COD players "
         "from Supabase..."
     )
 
-    result = (
+
+    response = (
         supabase
         .table("players")
         .select(
@@ -355,117 +472,400 @@ def load_cod_players():
         .execute()
     )
 
-    players = result.data or []
 
-    cleaned = []
+    players = response.data or []
+
+
+    # --------------------------------------------------------
+    # VALIDATE / DEDUPLICATE
+    # --------------------------------------------------------
+
+    cleaned = {}
 
     for player in players:
 
-        fid = player.get("fid")
-        state = player.get("state")
+        fid = player.get(
+            "fid"
+        )
 
-        if not fid:
+        if fid is None:
             continue
 
-        if not state:
-            log(
-                f"Skipping {fid}: "
-                "no state in players table."
+
+        fid = str(
+            fid
+        ).strip()
+
+
+        if not fid.isdigit():
+            continue
+
+
+        state = player.get(
+            "state"
+        )
+
+
+        if state is None:
+
+            state = DEFAULT_STATE
+
+
+        try:
+
+            state = int(
+                state
             )
-            continue
 
-        cleaned.append(player)
+        except Exception:
+
+            state = DEFAULT_STATE
 
 
-    cleaned.sort(
-        key=lambda x: int(x["fid"])
+        cleaned[fid] = {
+
+            "fid":
+                fid,
+
+            "player_name":
+                player.get(
+                    "player_name"
+                )
+                or
+                f"Player {fid}",
+
+            "alliance":
+                ALLIANCE,
+
+            "state":
+                state,
+
+        }
+
+
+    result = list(
+        cleaned.values()
+    )
+
+
+    result.sort(
+        key=lambda p: int(
+            p["fid"]
+        )
     )
 
 
     log(
-        f"Loaded {len(cleaned)} "
-        "active COD players."
+        f"Loaded {len(result)} "
+        "active COD player(s)."
     )
 
-    return cleaned
+
+    return result
 
 
 # ============================================================
-# SIGN WOS REQUEST
+# WOS SIGNATURE
 # ============================================================
 
-def encode_data(data):
+def sign_payload(data):
 
     sorted_keys = sorted(
         data.keys()
     )
 
+
     encoded = "&".join(
+
         f"{key}={data[key]}"
+
         for key in sorted_keys
+
     )
 
+
     raw = (
-        encoded +
+        encoded
+        +
         WOS_ENCRYPT_KEY
     )
+
 
     signature = hashlib.md5(
         raw.encode()
     ).hexdigest()
 
+
     return {
-        "sign": signature,
+
+        "sign":
+            signature,
+
         **data
+
     }
 
 
 # ============================================================
-# WOS REQUEST
+# WOS RESPONSE CLASSIFICATION
 # ============================================================
 
-def redeem_once(
+def classify_response(data):
+
+    msg = str(
+        data.get(
+            "msg",
+            "UNKNOWN"
+        )
+    ).strip(
+        "."
+    )
+
+
+    err_code = data.get(
+        "err_code"
+    )
+
+
+    # --------------------------------------------------------
+    # SUCCESS
+    # --------------------------------------------------------
+
+    if msg == "SUCCESS":
+
+        return (
+            "success",
+            "Successfully redeemed"
+        )
+
+
+    if (
+        msg == "SAME TYPE EXCHANGE"
+        and
+        err_code == 40011
+    ):
+
+        return (
+            "success",
+            "Successfully redeemed"
+        )
+
+
+    # --------------------------------------------------------
+    # ALREADY REDEEMED
+    # --------------------------------------------------------
+
+    if (
+        msg == "RECEIVED"
+        and
+        err_code == 40008
+    ):
+
+        return (
+            "already_redeemed",
+            "Already redeemed"
+        )
+
+
+    # --------------------------------------------------------
+    # WRONG STATE
+    # --------------------------------------------------------
+
+    if (
+        msg == "USER INFO ERROR"
+        and
+        err_code == 40020
+    ):
+
+        return (
+            "wrong_state",
+            "Wrong state for player"
+        )
+
+
+    # --------------------------------------------------------
+    # RATE LIMIT
+    # --------------------------------------------------------
+
+    if (
+        msg == "TOO FREQUENT"
+        and
+        err_code == 40019
+    ):
+
+        return (
+            "rate_limited",
+            "Too frequent"
+        )
+
+
+    # --------------------------------------------------------
+    # SERVER ASKS US TO RETRY
+    # --------------------------------------------------------
+
+    if (
+        msg == "TIMEOUT RETRY"
+        and
+        err_code == 40004
+    ):
+
+        return (
+            "retry",
+            "Server requested retry"
+        )
+
+
+    # --------------------------------------------------------
+    # EXPIRED
+    # --------------------------------------------------------
+
+    if (
+        msg == "TIME ERROR"
+        and
+        err_code == 40007
+    ):
+
+        return (
+            "expired",
+            "Gift code expired"
+        )
+
+
+    # --------------------------------------------------------
+    # INVALID
+    # --------------------------------------------------------
+
+    if (
+        msg == "CDK NOT FOUND"
+        and
+        err_code == 40014
+    ):
+
+        return (
+            "invalid",
+            "Gift code not found"
+        )
+
+
+    # --------------------------------------------------------
+    # GLOBAL CLAIM LIMIT
+    # --------------------------------------------------------
+
+    if (
+        msg == "USED"
+        and
+        err_code == 40005
+    ):
+
+        return (
+            "claim_limit",
+            "Gift code claim limit reached"
+        )
+
+
+    # --------------------------------------------------------
+    # PLAYER DOES NOT EXIST
+    # --------------------------------------------------------
+
+    if (
+        err_code == 40001
+        and
+        "not exist" in msg.lower()
+    ):
+
+        return (
+            "failed",
+            "Player does not exist"
+        )
+
+
+    # --------------------------------------------------------
+    # FURNACE REQUIREMENT
+    # --------------------------------------------------------
+
+    if (
+        msg == "STOVE_LV ERROR"
+        and
+        err_code == 40006
+    ):
+
+        return (
+            "failed",
+            "Furnace level too low"
+        )
+
+
+    # --------------------------------------------------------
+    # SPENDING REQUIREMENT
+    # --------------------------------------------------------
+
+    if (
+        msg == "RECHARGE_MONEY ERROR"
+        and
+        err_code == 40017
+    ):
+
+        return (
+            "failed",
+            "Spending requirement not met"
+        )
+
+
+    # --------------------------------------------------------
+    # VIP REQUIREMENT
+    # --------------------------------------------------------
+
+    if (
+        msg == "RECHARGE_MONEY_VIP ERROR"
+        and
+        err_code == 40018
+    ):
+
+        return (
+            "failed",
+            "VIP requirement not met"
+        )
+
+
+    # --------------------------------------------------------
+    # UNKNOWN
+    # --------------------------------------------------------
+
+    return (
+        "failed",
+        f"{msg} ({err_code})"
+    )
+
+
+# ============================================================
+# REDEEM ONE REQUEST
+# ============================================================
+
+def redeem_request(
     fid,
     state,
     code
 ):
 
-    payload = encode_data({
+    payload = sign_payload({
 
-        "fid": str(fid),
+        "fid":
+            str(fid),
 
-        "cdk": code,
+        "cdk":
+            str(code),
 
-        "kid": str(state),
+        "kid":
+            str(state),
 
-        "time": str(
-            int(time.time())
-        )
+        "time":
+            str(
+                int(
+                    time.time()
+                )
+            ),
 
     })
-
-
-    headers = {
-
-        "accept":
-            "application/json, text/plain, */*",
-
-        "content-type":
-            "application/x-www-form-urlencoded",
-
-        "origin":
-            WOS_ORIGIN,
-
-        "referer":
-            WOS_ORIGIN + "/",
-
-        "user-agent":
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/135.0 Safari/537.36"
-    }
 
 
     for attempt in range(
@@ -475,583 +875,89 @@ def redeem_once(
 
         try:
 
-            response = requests.post(
+            response = session.post(
 
                 WOS_REDEEM_URL,
 
                 data=payload,
 
-                headers=headers,
+                timeout=30
 
-                timeout=(10, 30)
             )
 
 
-            if response.status_code == 200:
+            # -----------------------------------------------
+            # HTTP RATE LIMIT
+            # -----------------------------------------------
 
-                try:
-                    return classify_response(
-                        response.json()
-                    )
+            if response.status_code == 429:
 
-                except ValueError:
+                log(
+                    "HTTP 429. "
+                    f"Transport retry {attempt}/"
+                    f"{TRANSPORT_RETRIES}"
+                )
 
-                    return (
-                        "failed",
-                        "Invalid JSON response"
-                    )
+                time.sleep(
+                    TRANSPORT_RETRY_DELAY
+                    *
+                    attempt
+                )
 
+                continue
+
+
+            # -----------------------------------------------
+            # TEMPORARY SERVER ERRORS
+            # -----------------------------------------------
 
             if response.status_code in (
-                429,
                 502,
                 503,
                 504
             ):
 
                 log(
-                    f"{fid}: HTTP "
-                    f"{response.status_code}; "
-                    f"retry {attempt}/"
-                    f"{TRANSPORT_RETRIES}"
+                    f"HTTP {response.status_code}. "
+                    "Retrying..."
                 )
 
                 time.sleep(
-                    attempt * 3
+                    TRANSPORT_RETRY_DELAY
+                    *
+                    attempt
                 )
 
                 continue
 
 
-            return (
-                "failed",
-                "HTTP "
-                f"{response.status_code}: "
-                f"{response.text[:150]}"
-            )
+            if response.status_code != 200:
 
-
-        except requests.RequestException as exc:
-
-            log(
-                f"{fid}: request error "
-                f"{attempt}/"
-                f"{TRANSPORT_RETRIES}: "
-                f"{exc}"
-            )
-
-            if attempt < TRANSPORT_RETRIES:
-
-                time.sleep(
-                    attempt * 3
+                return (
+                    "failed",
+                    (
+                        f"HTTP "
+                        f"{response.status_code}: "
+                        f"{response.text[:150]}"
+                    )
                 )
 
 
-    return (
-        "failed",
-        "WOS API request failed"
-    )
+            try:
 
+                data = response.json()
 
-# ============================================================
-# CLASSIFY WOS RESPONSE
-# ============================================================
+            except Exception:
 
-def classify_response(data):
-
-    message = str(
-        data.get(
-            "msg",
-            "Unknown error"
-        )
-    ).strip(".")
-
-
-    err_code = data.get(
-        "err_code"
-    )
-
-
-    if message == "SUCCESS":
-
-        return (
-            "success",
-            "Successfully redeemed"
-        )
-
-
-    if (
-        message == "SAME TYPE EXCHANGE"
-        and err_code == 40011
-    ):
-
-        return (
-            "success",
-            "Successfully redeemed"
-        )
-
-
-    if (
-        message == "RECEIVED"
-        and err_code == 40008
-    ):
-
-        return (
-            "already_redeemed",
-            "Already redeemed"
-        )
-
-
-    if (
-        message == "TOO FREQUENT"
-        and err_code == 40019
-    ):
-
-        return (
-            "rate_limited",
-            "Rate limited"
-        )
-
-
-    if (
-        message == "USER INFO ERROR"
-        and err_code == 40020
-    ):
-
-        return (
-            "wrong_state",
-            "Wrong state"
-        )
-
-
-    if (
-        message == "TIME ERROR"
-        and err_code == 40007
-    ):
-
-        return (
-            "expired",
-            "Code expired"
-        )
-
-
-    if (
-        message == "CDK NOT FOUND"
-        and err_code == 40014
-    ):
-
-        return (
-            "invalid",
-            "Code not found"
-        )
-
-
-    if (
-        message == "USED"
-        and err_code == 40005
-    ):
-
-        return (
-            "claim_limit",
-            "Claim limit reached"
-        )
-
-
-    if (
-        message == "TIMEOUT RETRY"
-        and err_code == 40004
-    ):
-
-        return (
-            "retry",
-            "Server requested retry"
-        )
-
-
-    if (
-        message == "STOVE_LV ERROR"
-        and err_code == 40006
-    ):
-
-        return (
-            "failed",
-            "Furnace level too low"
-        )
-
-
-    if (
-        message == "RECHARGE_MONEY ERROR"
-        and err_code == 40017
-    ):
-
-        return (
-            "failed",
-            "Spending requirement not met"
-        )
-
-
-    if (
-        message == "RECHARGE_MONEY_VIP ERROR"
-        and err_code == 40018
-    ):
-
-        return (
-            "failed",
-            "VIP requirement not met"
-        )
-
-
-    if (
-        err_code == 40001
-        and "not exist" in message.lower()
-    ):
-
-        return (
-            "failed",
-            "Player does not exist"
-        )
-
-
-    return (
-        "failed",
-        f"{message} ({err_code})"
-    )
-
-
-# ============================================================
-# DATABASE REDEMPTION RECORD
-# ============================================================
-
-def existing_redemption(
-    code,
-    fid
-):
-
-    result = (
-        supabase
-        .table(
-            "gift_code_redemptions"
-        )
-        .select("*")
-        .eq(
-            "code",
-            code
-        )
-        .eq(
-            "fid",
-            int(fid)
-        )
-        .limit(1)
-        .execute()
-    )
-
-    if result.data:
-        return result.data[0]
-
-    return None
-
-
-def save_redemption(
-    gift_code_id,
-    code,
-    player,
-    status,
-    message,
-    attempts
-):
-
-    fid = int(
-        player["fid"]
-    )
-
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-    existing = existing_redemption(
-        code,
-        fid
-    )
-
-
-    payload = {
-
-        "gift_code_id":
-            gift_code_id,
-
-        "code":
-            code,
-
-        "fid":
-            fid,
-
-        "player_name":
-            player.get(
-                "player_name"
-            ),
-
-        "alliance":
-            player.get(
-                "alliance"
-            ),
-
-        "state":
-            int(
-                player["state"]
-            ),
-
-        "status":
-            status,
-
-        "message":
-            message,
-
-        "attempts":
-            attempts,
-
-        "last_attempt_at":
-            now
-    }
-
-
-    if status == "success":
-
-        payload[
-            "redeemed_at"
-        ] = now
-
-
-    if existing:
-
-        if not existing.get(
-            "first_attempt_at"
-        ):
-            payload[
-                "first_attempt_at"
-            ] = now
-
-        (
-            supabase
-            .table(
-                "gift_code_redemptions"
-            )
-            .update(payload)
-            .eq(
-                "id",
-                existing["id"]
-            )
-            .execute()
-        )
-
-    else:
-
-        payload[
-            "first_attempt_at"
-        ] = now
-
-        (
-            supabase
-            .table(
-                "gift_code_redemptions"
-            )
-            .insert(payload)
-            .execute()
-        )
-
-
-# ============================================================
-# REDEEM FOR ONE PLAYER
-# ============================================================
-
-def redeem_player(
-    gift_code_id,
-    code,
-    player
-):
-
-    fid = str(
-        player["fid"]
-    )
-
-    state = int(
-        player["state"]
-    )
-
-    name = (
-        player.get("player_name")
-        or fid
-    )
-
-
-    cooldown_count = 0
-
-    attempt = 0
-
-
-    while attempt < FID_RETRIES:
-
-        attempt += 1
-
-
-        status, message = redeem_once(
-            fid,
-            state,
-            code
-        )
-
-
-        log(
-            f"{name} ({fid}) | "
-            f"{status} | "
-            f"{message}"
-        )
-
-
-        if status == "rate_limited":
-
-            cooldown_count += 1
-
-
-            if (
-                cooldown_count
-                <= MAX_COOLDOWNS
-            ):
-
-                log(
-                    f"{fid}: waiting "
-                    f"{TOO_FREQUENT_DELAY}s "
-                    "before retry."
+                return (
+                    "failed",
+                    "WOS returned invalid JSON"
                 )
 
-                time.sleep(
-                    TOO_FREQUENT_DELAY
-                )
 
-                attempt -= 1
-
-                continue
-
-
-        if status == "retry":
-
-            if attempt < FID_RETRIES:
-
-                time.sleep(
-                    attempt * 2
-                )
-
-                continue
-
-
-        save_redemption(
-            gift_code_id,
-            code,
-            player,
-            status,
-            message,
-            attempt
-        )
-
-
-        return (
-            status,
-            message
-        )
-
-
-    save_redemption(
-        gift_code_id,
-        code,
-        player,
-        "failed",
-        "Maximum retries reached",
-        attempt
-    )
-
-
-    return (
-        "failed",
-        "Maximum retries reached"
-    )
-
-
-# ============================================================
-# PROCESS ONE CODE
-# ============================================================
-
-def process_code(
-    gift_record,
-    players
-):
-
-    gift_id = gift_record["id"]
-    code = gift_record["code"]
-
-
-    log(
-        "=" * 60
-    )
-
-    log(
-        f"PROCESSING GIFT CODE: {code}"
-    )
-
-    log(
-        "=" * 60
-    )
-
-
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-    update_gift_code(
-
-        gift_id,
-
-        status="processing",
-
-        started_at=now,
-
-        total_players=len(players)
-    )
-
-
-    totals = {
-
-        "success": 0,
-
-        "already_redeemed": 0,
-
-        "wrong_state": 0,
-
-        "failed": 0
-
-    }
-
-
-    fatal_status = None
-
-
-    for index, player in enumerate(
-        players,
-        start=1
-    ):
-
-        fid = player["fid"]
-
-        name = (
-            player.get(
-                "player_name"
+            return classify_response(
+                data
             )
-            or str(fid)
-        )
 
 
-        log(
-            f"[{index}/{len(players)}] "
-            f"{name} | "
-            f"FID {fid} | "
-            f"
+        except requests
