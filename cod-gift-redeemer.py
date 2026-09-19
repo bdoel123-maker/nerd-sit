@@ -85,11 +85,14 @@ CODE_SOURCE_URL = "https://wosoracle.com/api/codes"
 # TIMING
 # ------------------------------------------------------------
 
-PLAYER_DELAY = 1.25
+PLAYER_DELAY = 4.0
 
 TRANSPORT_RETRIES = 3
 
 TRANSPORT_RETRY_DELAY = 3
+
+HTTP_429_DEFAULT_WAIT = 60
+HTTP_429_MAX_WAIT = 300
 
 RATE_LIMIT_WAIT = 60
 
@@ -860,17 +863,36 @@ def redeem_request(
 
             if response.status_code == 429:
 
+                retry_after = response.headers.get(
+                    "Retry-After"
+                )
+
+                try:
+                    wait_seconds = int(
+                        float(retry_after)
+                    )
+                except (TypeError, ValueError):
+                    wait_seconds = (
+                        HTTP_429_DEFAULT_WAIT
+                        * attempt
+                    )
+
+                wait_seconds = max(
+                    HTTP_429_DEFAULT_WAIT,
+                    min(
+                        wait_seconds,
+                        HTTP_429_MAX_WAIT
+                    )
+                )
+
                 log(
                     "HTTP 429. "
                     f"Transport retry {attempt}/"
-                    f"{TRANSPORT_RETRIES}"
+                    f"{TRANSPORT_RETRIES}. "
+                    f"Waiting {wait_seconds}s before retry."
                 )
 
-                time.sleep(
-                    TRANSPORT_RETRY_DELAY
-                    *
-                    attempt
-                )
+                time.sleep(wait_seconds)
 
                 continue
 
