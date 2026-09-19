@@ -48,7 +48,7 @@ if not SUPABASE_KEY:
 # CONFIG
 # ============================================================
 
-GIFT_ALLIANCES = ("COD", "llc")
+GIFT_ALLIANCES = ("COD", "llc", "WET", "DRY", "ONF", "onf")
 
 DEFAULT_STATE = 2348
 
@@ -1650,77 +1650,194 @@ def get_codes_to_process():
 
 def main():
 
-    log("COD + llc WOS Gift Code Redeemer starting...")
+    log(
+        "State 2348 WOS Gift Code Redeemer starting "
+        f"for: {', '.join(GIFT_ALLIANCES)}"
+    )
 
     try:
-        cod_players = get_alliance_players("COD")
-        llc_players = get_alliance_players("llc")
 
-        if not cod_players and not llc_players:
-            log("No active COD or llc players found. Nothing to redeem.")
+        # --------------------------------------------------------
+        # LOAD CURRENT ACTIVE PLAYERS FROM THE STATE players TABLE
+        # --------------------------------------------------------
+
+        alliance_players = {}
+
+        for alliance in GIFT_ALLIANCES:
+
+            players = get_alliance_players(alliance)
+
+            alliance_players[alliance] = players
+
+
+        total_players = sum(
+            len(players)
+            for players in alliance_players.values()
+        )
+
+
+        if total_players == 0:
+
+            log(
+                "No active gift-code players found "
+                "in any configured alliance."
+            )
+
             discord_message(
                 "⚠️ **COD Gift Code Redeemer**\n\n"
                 "No active COD players were found in Supabase."
             )
+
             return
 
-        # Discover active codes directly. A code may already be marked completed
-        # for COD while a newly-added llc player still needs it.
+
+        for alliance, players in alliance_players.items():
+
+            log(
+                f"{alliance}: {len(players)} active player(s)"
+            )
+
+
+        # --------------------------------------------------------
+        # DISCOVER CURRENT ACTIVE CODES
+        #
+        # We intentionally process all currently-active codes.
+        # A code may already be completed for COD while a player
+        # in another alliance has never received it.
+        # --------------------------------------------------------
+
         discovered = discover_gift_codes()
 
+
         if not discovered:
-            log("No active gift codes discovered.")
+
+            log(
+                "No active gift codes discovered."
+            )
+
             return
 
-        gift_codes = []
-        for code in discovered:
-            existing = get_existing_code(code)
-            if existing:
-                gift_codes.append(existing)
-            else:
-                gift_codes.append(create_gift_code(code))
 
-        log(f"{len(gift_codes)} active gift code(s) available for processing.")
+        gift_codes = []
+
+
+        for code in discovered:
+
+            existing = get_existing_code(
+                code
+            )
+
+            if existing:
+
+                gift_codes.append(
+                    existing
+                )
+
+            else:
+
+                gift_codes.append(
+                    create_gift_code(code)
+                )
+
+
+        log(
+            f"{len(gift_codes)} active gift code(s) "
+            "available for processing."
+        )
+
+
+        # --------------------------------------------------------
+        # PROCESS EACH CODE FOR EACH ALLIANCE
+        #
+        # COD keeps Discord reporting.
+        # llc / WET / DRY / ONF / onf are silent.
+        #
+        # Existing code+FID results prevent duplicate redemption
+        # when a player changes alliances.
+        # --------------------------------------------------------
 
         for gift_code in gift_codes:
-            code = gift_code.get("code", "UNKNOWN")
 
-            if cod_players:
-                log(f"Starting COD redemption pass for {code}.")
+            code = gift_code.get(
+                "code",
+                "UNKNOWN"
+            )
+
+
+            for alliance in GIFT_ALLIANCES:
+
+                players = alliance_players.get(
+                    alliance,
+                    []
+                )
+
+
+                if not players:
+
+                    log(
+                        f"{alliance}: no active players. "
+                        f"Skipping {code}."
+                    )
+
+                    continue
+
+
+                send_discord = (
+                    alliance == "COD"
+                )
+
+
+                log(
+                    f"Starting {alliance} redemption "
+                    f"pass for {code}."
+                )
+
+
                 try:
+
                     process_gift_code(
                         gift_code,
-                        cod_players,
-                        send_discord=True
-                    )
-                except Exception as exc:
-                    log(f"COD error processing {code}: {exc}")
-                    discord_message(
-                        "❌ **COD Gift Code Error**\n\n"
-                        f"Code: `{code}`\n"
-                        f"Error: `{str(exc)[:500]}`"
+                        players,
+                        send_discord=send_discord
                     )
 
-            if llc_players:
-                log(f"Starting llc redemption pass for {code}.")
-                try:
-                    process_gift_code(
-                        gift_code,
-                        llc_players,
-                        send_discord=False
-                    )
-                except Exception as exc:
-                    # llc errors stay in the Actions log only.
-                    log(f"llc error processing {code}: {exc}")
 
-        log("COD + llc WOS Gift Code Redeemer finished.")
+                except Exception as exc:
+
+                    log(
+                        f"{alliance} error processing "
+                        f"{code}: {exc}"
+                    )
+
+
+                    # Only COD errors go to Discord.
+                    if send_discord:
+
+                        discord_message(
+                            "❌ **COD Gift Code Error**\n\n"
+                            f"Code: `{code}`\n"
+                            f"Error: `{str(exc)[:500]}`"
+                        )
+
+
+        log(
+            "State 2348 WOS Gift Code Redeemer finished."
+        )
+
 
     except Exception as exc:
-        log(f"Fatal application error: {exc}")
+
+        log(
+            f"Fatal application error: {exc}"
+        )
+
+
         discord_message(
             "❌ **COD Gift Code Redeemer Failed**\n\n"
             f"`{str(exc)[:1000]}`"
         )
+
+
         raise
 
 
