@@ -1002,7 +1002,10 @@ def make_database_row(
         "power": power,
         "kills": player.get("kills", 0) or 0,
         "labyrinth_score": player.get("labyrinth_score", 0) or 0,
-        "active": player.get("active"),
+        # A player discovered in one of our tracked State 2348 alliances
+        # is active for this sync. This also automatically reactivates a
+        # player who previously left the state and later returned.
+        "active": True,
         "api_updated": player.get("updated_at"),
     }
 
@@ -1145,6 +1148,359 @@ def upsert_players(rows):
             success = False
 
     return success
+
+
+# ============================================================
+# STATE-WIDE PLAYER PRESENCE / GONE PLAYER CLEANUP
+# ============================================================
+
+def discover_all_state_player_ids():
+
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        f"   CHECKING ALL PLAYERS IN STATE {STATE_ID}"
+    )
+    print(
+        "========================================"
+    )
+    print()
+
+    state = get_state(STATE_ID)
+
+    if not state:
+        print(
+            "Could not load state for inactive-player check. "
+            "Skipping cleanup."
+        )
+        return None
+
+    alliances = state.get("alliances", [])
+
+    if not isinstance(alliances, list) or not alliances:
+        print(
+            "State returned no alliances for inactive-player check. "
+            "Skipping cleanup."
+        )
+        return None
+
+    state_player_ids = set()
+    failed_alliances = []
+
+    print(
+        f"Checking {len(alliances)} alliances in State {STATE_ID}..."
+    )
+
+    for position, alliance_summary in enumerate(
+        alliances,
+        start=1,
+    ):
+
+        alliance_id = alliance_summary.get("id")
+
+        abbreviation = str(
+            alliance_summary.get(
+                "abbr",
+                "???",
+            )
+        ).strip()
+
+        if not alliance_id:
+            print(
+                f"[{position}/{len(alliances)}] "
+                f"{abbreviation}: no alliance ID - "
+                "cleanup will be skipped for safety."
+            )
+            failed_alliances.append(abbreviation)
+            continue
+
+        alliance = get_alliance(alliance_id)
+
+        if not alliance:
+            print(
+                f"[{position}/{len(alliances)}] "
+                f"{abbreviation}: FAILED - "
+                "cleanup will be skipped for safety."
+            )
+            failed_alliances.append(abbreviation)
+            continue
+
+        members = alliance.get("members")
+
+        if not isinstance(members, list):
+            print(
+                f"[{position}/{len(alliances)}] "
+                f"{abbreviation}: invalid member list - "
+                "cleanup will be skipped for safety."
+            )
+            failed_alliances.append(abbreviation)
+            continue
+
+        for member in members:
+
+            fid = str(
+                member.get(
+                    "id",
+                    "",
+                )
+            ).strip()
+
+            if fid:
+                state_player_ids.add(fid)
+
+        print(
+            f"[{position}/{len(alliances)}] "
+            f"{abbreviation}: {len(members)} members"
+        )
+
+        # Keep this conservative so the state-wide check does not
+        # hammer WOS Oracle with every alliance at once.
+        time.sleep(0.5)
+
+    if failed_alliances:
+
+        print()
+        print(
+            "WARNING: One or more State 2348 alliances could not "
+            "be verified."
+        )
+        print(
+            "No players will be marked inactive during this run."
+        )
+        print(
+            "Failed alliances: "
+            + ", ".join(failed_alliances)
+        )
+
+        return None
+
+    if not state_player_ids:
+
+        print(
+            "State-wide player scan returned zero players. "
+            "Skipping cleanup for safety."
+        )
+        return None
+
+    print()
+    print(
+        f"State-wide presence check found "
+        f"{len(state_player_ids)} players."
+    )
+
+    return state_player_ids
+
+
+def get_tracked_database_players():
+
+    endpoint = (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/players"
+    )
+
+    params = {
+        "select": "fid,player,alliance,state,active",
+        "state": f"eq.{STATE_ID}",
+    }
+
+    try:
+
+        response = requests.get(
+            endpoint,
+            headers=SUPABASE_HEADERS,
+            params=params,
+            timeout=60,
+        )
+
+    except requests.RequestException as error:
+
+        print(
+            f"SUPABASE NETWORK ERROR | "
+            f"loading existing players | {error}"
+        )
+
+        return None
+
+    if not 200 <= response.status_code < 300:
+
+        print(
+            f"SUPABASE ERROR | "
+            f"loading existing players | "
+            f"HTTP {response.status_code}"
+        )
+        print(response.text)
+
+        return None
+
+    try:
+        data = response.json()
+
+    except ValueError:
+
+        print(
+            "SUPABASE INVALID JSON | "
+            "loading existing players"
+        )
+
+        return None
+
+    if not isinstance(data, list):
+
+        print(
+            "SUPABASE returned an invalid player list. "
+            "Skipping inactive-player cleanup."
+        )
+
+        return None
+
+    return data
+
+
+def mark_players_no_longer_in_state_inactive(state_player_ids):
+
+    if state_player_ids is None:
+
+        print()
+        print(
+            "Inactive-player cleanup skipped because "
+            "the complete state roster was not verified."
+        )
+
+        return True, 0
+
+    existing_players = get_tracked_database_players()
+
+    if existing_players is None:
+
+        print()
+        print(
+            "Inactive-player cleanup skipped because "
+            "existing Supabase players could not be loaded."
+        )
+
+        return False, 0
+
+    gone_players = []
+
+    for player in existing_players:
+
+        fid = str(
+            player.get(
+                "fid",
+                "",
+            )
+        ).strip()
+
+        if not fid:
+            continue
+
+        if fid not in state_player_ids:
+
+            # Avoid repeatedly PATCHing players that were already
+            # marked inactive by an earlier successful sync.
+            if player.get("active") is False:
+                continue
+
+            gone_players.append(player)
+
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        "        GONE PLAYER CHECK"
+    )
+    print(
+        "========================================"
+    )
+
+    if not gone_players:
+
+        print(
+            "No newly departed State 2348 players found."
+        )
+
+        return True, 0
+
+    print(
+        f"Players no longer in State {STATE_ID}: "
+        f"{len(gone_players)}"
+    )
+    print()
+
+    endpoint = (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/players"
+    )
+
+    success = True
+    marked_count = 0
+
+    for player in gone_players:
+
+        fid = str(player["fid"])
+        name = player.get("player") or "Unknown"
+        alliance = player.get("alliance") or "???"
+
+        params = {
+            "fid": f"eq.{fid}",
+        }
+
+        try:
+
+            response = requests.patch(
+                endpoint,
+                headers=SUPABASE_HEADERS,
+                params=params,
+                json={
+                    "active": False,
+                },
+                timeout=30,
+            )
+
+        except requests.RequestException as error:
+
+            print(
+                f"FAILED TO MARK GONE: "
+                f"{name} | {fid} | {error}"
+            )
+
+            success = False
+            continue
+
+        if 200 <= response.status_code < 300:
+
+            marked_count += 1
+
+            print(
+                f"GONE: "
+                f"{name} "
+                f"| {fid} "
+                f"| Former alliance {alliance} "
+                f"| active = false"
+            )
+
+        else:
+
+            print(
+                f"FAILED TO MARK GONE: "
+                f"{name} "
+                f"| {fid} "
+                f"| HTTP {response.status_code}"
+            )
+            print(response.text)
+
+            success = False
+
+    print()
+    print(
+        f"Players marked inactive/gone: "
+        f"{marked_count}"
+    )
+
+    return success, marked_count
 
 
 # ============================================================
@@ -1504,6 +1860,37 @@ def main():
 
 
     # ========================================================
+    # MARK PLAYERS WHO LEFT STATE 2348 AS INACTIVE / GONE
+    # ========================================================
+
+    inactive_cleanup_success = True
+    players_marked_gone = 0
+
+    # Only run the cleanup after all target-player database writes
+    # succeeded. This prevents a partial/failed sync from changing
+    # player status.
+    if database_failures == 0:
+
+        state_player_ids = discover_all_state_player_ids()
+
+        (
+            inactive_cleanup_success,
+            players_marked_gone,
+
+        ) = mark_players_no_longer_in_state_inactive(
+            state_player_ids
+        )
+
+    else:
+
+        print()
+        print(
+            "Skipping inactive-player cleanup because "
+            "one or more database batches failed."
+        )
+
+
+    # ========================================================
     # RUNTIME
     # ========================================================
 
@@ -1561,6 +1948,24 @@ def main():
         )
 
         raise SystemExit(1)
+
+
+    if not inactive_cleanup_success:
+
+        print()
+        print(
+            "One or more inactive-player "
+            "database updates failed."
+        )
+
+        raise SystemExit(1)
+
+
+    print()
+    print(
+        f"Players marked gone this run: "
+        f"{players_marked_gone}"
+    )
 
 
     print()
