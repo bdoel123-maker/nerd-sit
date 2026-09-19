@@ -959,5 +959,829 @@ def redeem_request(
                 data
             )
 
+        except requests.RequestException as exc:
 
-        except requests
+            log(
+                f"WOS request error "
+                f"(attempt {attempt}/{TRANSPORT_RETRIES}): "
+                f"{exc}"
+            )
+
+            if attempt < TRANSPORT_RETRIES:
+
+                time.sleep(
+                    TRANSPORT_RETRY_DELAY * attempt
+                )
+
+                continue
+
+            return (
+                "failed",
+                f"Transport error: {exc}"
+            )
+
+
+        except Exception as exc:
+
+            return (
+                "failed",
+                f"Unexpected redemption error: {exc}"
+            )
+
+
+    return (
+        "failed",
+        "Transport retries exhausted"
+    )
+
+
+# ============================================================
+# REDEMPTION DATABASE HELPERS
+# ============================================================
+
+def get_existing_redemption(code, fid):
+
+    response = (
+        supabase
+        .table("gift_code_redemptions")
+        .select("*")
+        .eq("code", code)
+        .eq("fid", int(fid))
+        .limit(1)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+
+    return None
+
+
+def save_redemption(
+    gift_code_id,
+    code,
+    player,
+    status,
+    message,
+    attempts=1
+):
+
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    existing = get_existing_redemption(
+        code,
+        player["fid"]
+    )
+
+    values = {
+
+        "gift_code_id":
+            gift_code_id,
+
+        "code":
+            code,
+
+        "fid":
+            int(player["fid"]),
+
+        "player_name":
+            player["player_name"],
+
+        "alliance":
+            player["alliance"],
+
+        "state":
+            int(player["state"]),
+
+        "status":
+            status,
+
+        "message":
+            message,
+
+        "attempts":
+            attempts,
+
+        "last_attempt_at":
+            now,
+    }
+
+
+    if status in (
+        "success",
+        "already_redeemed"
+    ):
+
+        values["redeemed_at"] = now
+
+
+    if existing:
+
+        old_attempts = (
+            existing.get("attempts")
+            or 0
+        )
+
+        values["attempts"] = (
+            old_attempts + attempts
+        )
+
+        (
+            supabase
+            .table("gift_code_redemptions")
+            .update(values)
+            .eq(
+                "id",
+                existing["id"]
+            )
+            .execute()
+        )
+
+    else:
+
+        values["first_attempt_at"] = now
+
+        (
+            supabase
+            .table("gift_code_redemptions")
+            .insert(values)
+            .execute()
+        )
+
+
+# ============================================================
+# UPDATE GIFT CODE SUMMARY
+# ============================================================
+
+def update_gift_code_summary(
+    gift_code_id,
+    status,
+    total_players,
+    successful,
+    already_redeemed,
+    failed,
+    wrong_state
+):
+
+    values = {
+
+        "status":
+            status,
+
+        "total_players":
+            total_players,
+
+        "successful":
+            successful,
+
+        "already_redeemed":
+            already_redeemed,
+
+        "failed":
+            failed,
+
+        "wrong_state":
+            wrong_state,
+    }
+
+
+    if status in (
+        "completed",
+        "expired",
+        "invalid",
+        "claim_limit",
+        "failed"
+    ):
+
+        values["completed_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+
+    (
+        supabase
+        .table("gift_codes")
+        .update(values)
+        .eq(
+            "id",
+            gift_code_id
+        )
+        .execute()
+    )
+
+
+# ============================================================
+# PROCESS ONE GIFT CODE
+# ============================================================
+
+def process_gift_code(
+    gift_code,
+    players
+):
+
+    code = gift_code["code"]
+
+    gift_code_id = gift_code["id"]
+
+
+    log(
+        "=" * 60
+    )
+
+    log(
+        f"Processing gift code: {code}"
+    )
+
+    log(
+        "=" * 60
+    )
+
+
+    (
+        supabase
+        .table("gift_codes")
+        .update({
+
+            "status":
+                "processing",
+
+            "started_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+            "total_players":
+                len(players),
+
+        })
+        .eq(
+            "id",
+            gift_code_id
+        )
+        .execute()
+    )
+
+
+    successful = 0
+    already_redeemed = 0
+    failed = 0
+    wrong_state = 0
+
+    processed = 0
+
+
+    # --------------------------------------------------------
+    # PROCESS PLAYERS
+    # --------------------------------------------------------
+
+    for index, player in enumerate(
+        players,
+        start=1
+    ):
+
+        fid = player["fid"]
+
+        name = player["player_name"]
+
+        state = player["state"]
+
+
+        # ----------------------------------------------------
+        # SKIP FINAL RESULTS ALREADY SAVED
+        # ----------------------------------------------------
+
+        existing = get_existing_redemption(
+            code,
+            fid
+        )
+
+
+        if existing:
+
+            existing_status = (
+                existing.get("status")
+            )
+
+
+            if existing_status in (
+                "success",
+                "already_redeemed"
+            ):
+
+                log(
+                    f"[{index}/{len(players)}] "
+                    f"{name} ({fid}) "
+                    f"already processed "
+                    f"[{existing_status}]"
+                )
+
+
+                if (
+                    existing_status
+                    == "success"
+                ):
+
+                    successful += 1
+
+                else:
+
+                    already_redeemed += 1
+
+
+                processed += 1
+
+                continue
+
+
+        # ----------------------------------------------------
+        # REDEEM
+        # ----------------------------------------------------
+
+        log(
+            f"[{index}/{len(players)}] "
+            f"Redeeming {code} for "
+            f"{name} ({fid}) "
+            f"State {state}"
+        )
+
+
+        status = None
+        message = None
+
+        attempt_count = 0
+
+
+        for rate_attempt in range(
+            MAX_RATE_LIMIT_RETRIES + 1
+        ):
+
+            attempt_count += 1
+
+
+            status, message = redeem_request(
+                fid,
+                state,
+                code
+            )
+
+
+            # ------------------------------------------------
+            # PER-PLAYER RATE LIMIT
+            # ------------------------------------------------
+
+            if status == "rate_limited":
+
+                if (
+                    rate_attempt
+                    < MAX_RATE_LIMIT_RETRIES
+                ):
+
+                    log(
+                        f"{name} ({fid}) "
+                        "is rate limited. "
+                        f"Waiting "
+                        f"{RATE_LIMIT_WAIT}s..."
+                    )
+
+                    time.sleep(
+                        RATE_LIMIT_WAIT
+                    )
+
+                    continue
+
+
+                status = "failed"
+
+                message = (
+                    "Rate limit retries exhausted"
+                )
+
+
+            # ------------------------------------------------
+            # SERVER RETRY
+            # ------------------------------------------------
+
+            if status == "retry":
+
+                if (
+                    rate_attempt
+                    < MAX_RATE_LIMIT_RETRIES
+                ):
+
+                    log(
+                        f"{name} ({fid}) "
+                        "requested retry. "
+                        "Waiting 5 seconds..."
+                    )
+
+                    time.sleep(5)
+
+                    continue
+
+
+                status = "failed"
+
+                message = (
+                    "Server retry limit exhausted"
+                )
+
+
+            break
+
+
+        # ----------------------------------------------------
+        # SAVE RESULT
+        # ----------------------------------------------------
+
+        save_redemption(
+            gift_code_id,
+            code,
+            player,
+            status,
+            message,
+            attempt_count
+        )
+
+
+        processed += 1
+
+
+        log(
+            f"    -> {status}: {message}"
+        )
+
+
+        # ----------------------------------------------------
+        # COUNTERS
+        # ----------------------------------------------------
+
+        if status == "success":
+
+            successful += 1
+
+
+        elif status == "already_redeemed":
+
+            already_redeemed += 1
+
+
+        elif status == "wrong_state":
+
+            wrong_state += 1
+
+
+        else:
+
+            failed += 1
+
+
+        # ----------------------------------------------------
+        # CODE-WIDE TERMINAL RESPONSES
+        # ----------------------------------------------------
+
+        if status in (
+            "expired",
+            "invalid",
+            "claim_limit"
+        ):
+
+            log(
+                f"Gift code {code} returned "
+                f"{status}. Stopping this code."
+            )
+
+
+            update_gift_code_summary(
+                gift_code_id,
+                status,
+                len(players),
+                successful,
+                already_redeemed,
+                failed,
+                wrong_state
+            )
+
+
+            post_summary(
+                code,
+                status,
+                len(players),
+                processed,
+                successful,
+                already_redeemed,
+                failed,
+                wrong_state
+            )
+
+
+            return
+
+
+        # ----------------------------------------------------
+        # DELAY BETWEEN PLAYERS
+        # ----------------------------------------------------
+
+        if index < len(players):
+
+            time.sleep(
+                PLAYER_DELAY
+            )
+
+
+    # --------------------------------------------------------
+    # COMPLETED
+    # --------------------------------------------------------
+
+    update_gift_code_summary(
+        gift_code_id,
+        "completed",
+        len(players),
+        successful,
+        already_redeemed,
+        failed,
+        wrong_state
+    )
+
+
+    post_summary(
+        code,
+        "completed",
+        len(players),
+        processed,
+        successful,
+        already_redeemed,
+        failed,
+        wrong_state
+    )
+
+
+# ============================================================
+# DISCORD SUMMARY
+# ============================================================
+
+def post_summary(
+    code,
+    status,
+    total,
+    processed,
+    successful,
+    already_redeemed,
+    failed,
+    wrong_state
+):
+
+    if status == "completed":
+
+        title = "🎁 COD Gift Code Complete"
+
+    elif status == "expired":
+
+        title = "⌛ COD Gift Code Expired"
+
+    elif status == "invalid":
+
+        title = "❌ Invalid COD Gift Code"
+
+    elif status == "claim_limit":
+
+        title = "⚠️ Gift Code Claim Limit Reached"
+
+    else:
+
+        title = "🎁 COD Gift Code Result"
+
+
+    content = (
+        f"**{title}**\n\n"
+        f"**Code:** `{code}`\n"
+        f"**Status:** `{status}`\n\n"
+        f"👥 COD Players: **{total}**\n"
+        f"🔄 Processed: **{processed}**\n"
+        f"✅ Redeemed: **{successful}**\n"
+        f"☑️ Already redeemed: "
+        f"**{already_redeemed}**\n"
+        f"🗺️ Wrong state: "
+        f"**{wrong_state}**\n"
+        f"❌ Failed: **{failed}**"
+    )
+
+
+    discord_message(
+        content
+    )
+
+
+# ============================================================
+# FIND CODES TO PROCESS
+# ============================================================
+
+def get_codes_to_process():
+
+    discovered = discover_gift_codes()
+
+
+    if not discovered:
+
+        log(
+            "No public gift codes discovered."
+        )
+
+        return []
+
+
+    codes_to_process = []
+
+
+    for code in discovered:
+
+        existing = get_existing_code(
+            code
+        )
+
+
+        # ----------------------------------------------------
+        # BRAND NEW CODE
+        # ----------------------------------------------------
+
+        if not existing:
+
+            new_code = create_gift_code(
+                code
+            )
+
+            codes_to_process.append(
+                new_code
+            )
+
+            continue
+
+
+        # ----------------------------------------------------
+        # RETRY UNFINISHED CODE
+        # ----------------------------------------------------
+
+        status = existing.get(
+            "status"
+        )
+
+
+        if status in (
+            "pending",
+            "processing",
+            "failed"
+        ):
+
+            log(
+                f"Gift code {code} has "
+                f"status {status}. "
+                "Adding to processing queue."
+            )
+
+            codes_to_process.append(
+                existing
+            )
+
+            continue
+
+
+        log(
+            f"Gift code {code} already "
+            f"finished with status "
+            f"{status}. Skipping."
+        )
+
+
+    return codes_to_process
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    log(
+        "COD WOS Gift Code Redeemer starting..."
+    )
+
+
+    try:
+
+        players = get_cod_players()
+
+
+        if not players:
+
+            log(
+                "No active COD players found. "
+                "Nothing to redeem."
+            )
+
+            discord_message(
+                "⚠️ **COD Gift Code Redeemer**\n\n"
+                "No active COD players were found "
+                "in Supabase."
+            )
+
+            return
+
+
+        codes = get_codes_to_process()
+
+
+        if not codes:
+
+            log(
+                "No new gift codes to process."
+            )
+
+            return
+
+
+        log(
+            f"{len(codes)} gift code(s) "
+            "queued for processing."
+        )
+
+
+        for gift_code in codes:
+
+            try:
+
+                process_gift_code(
+                    gift_code,
+                    players
+                )
+
+            except Exception as exc:
+
+                code = gift_code.get(
+                    "code",
+                    "UNKNOWN"
+                )
+
+                log(
+                    f"Fatal error processing "
+                    f"{code}: {exc}"
+                )
+
+
+                try:
+
+                    update_gift_code_summary(
+                        gift_code["id"],
+                        "failed",
+                        len(players),
+                        0,
+                        0,
+                        1,
+                        0
+                    )
+
+                except Exception as db_exc:
+
+                    log(
+                        "Could not update failed "
+                        f"gift code: {db_exc}"
+                    )
+
+
+                discord_message(
+                    "❌ **COD Gift Code Error**\n\n"
+                    f"Code: `{code}`\n"
+                    f"Error: `{str(exc)[:500]}`"
+                )
+
+
+        log(
+            "COD WOS Gift Code Redeemer finished."
+        )
+
+
+    except Exception as exc:
+
+        log(
+            f"Fatal application error: {exc}"
+        )
+
+
+        discord_message(
+            "❌ **COD Gift Code Redeemer Failed**\n\n"
+            f"`{str(exc)[:1000]}`"
+        )
+
+
+        raise
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
