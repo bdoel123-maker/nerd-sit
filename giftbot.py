@@ -1,16 +1,20 @@
+# ============================================================
+# COD GIFT CODE BOT
+# Whiteout Survival
+# ============================================================
+
 import os
+import time
 import asyncio
 import hashlib
-import time
 from datetime import datetime, timezone
 
+import requests
 import discord
 from discord import app_commands
 from discord.ext import commands
-
-import requests
-from supabase import create_client
 from dotenv import load_dotenv
+from supabase import create_client
 
 
 # ============================================================
@@ -39,6 +43,11 @@ if not SUPABASE_KEY:
 
 ALLIANCE = "COD"
 
+PLAYERS_TABLE = "players"
+CODES_TABLE = "gift_codes"
+REDEMPTIONS_TABLE = "gift_code_redemptions"
+
+# WOS Gift Code API
 BASE_URL = "https://wos-giftcode-api.centurygame.com"
 REDEEM_URL = BASE_URL + "/api/gift_code"
 
@@ -46,13 +55,20 @@ ORIGIN = "https://wos-giftcode.centurygame.com"
 
 WOS_ENCRYPT_KEY = "tB87#kPtkxqOS2"
 
+# Delay between different players
 PLAYER_DELAY = 1.25
 
-TOO_FREQUENT_DELAY = 60
+# API transport retries
+MAX_HTTP_RETRIES = 3
 
-MAX_COOLDOWNS = 3
+# WOS 40019 cooldown
+RATE_LIMIT_WAIT = 60
 
-MAX_TRANSPORT_RETRIES = 3
+# Maximum times we'll revisit a rate-limited player
+MAX_RATE_LIMIT_RETRIES = 3
+
+# Timeout for HTTP requests
+HTTP_TIMEOUT = 30
 
 
 # ============================================================
@@ -62,18 +78,6 @@ MAX_TRANSPORT_RETRIES = 3
 supabase = create_client(
     SUPABASE_URL,
     SUPABASE_KEY
-)
-
-
-# ============================================================
-# DISCORD
-# ============================================================
-
-intents = discord.Intents.default()
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
 )
 
 
@@ -88,84 +92,47 @@ session.headers.update({
     "content-type": "application/x-www-form-urlencoded",
     "origin": ORIGIN,
     "referer": ORIGIN + "/",
-    "user-agent":
+    "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/140.0.0.0 Safari/537.36"
+    ),
 })
 
 
 # ============================================================
-# WOS RESPONSE MAP
+# DISCORD BOT
 # ============================================================
 
-RESULT_MESSAGES = {
+intents = discord.Intents.default()
 
-    "SUCCESS":
-        "Successfully redeemed",
-
-    "RECEIVED":
-        "Already redeemed",
-
-    "SAME TYPE EXCHANGE":
-        "Successfully redeemed",
-
-    "TIME ERROR":
-        "Code expired",
-
-    "CDK NOT FOUND":
-        "Invalid gift code",
-
-    "USED":
-        "Claim limit reached",
-
-    "TIMEOUT RETRY":
-        "Server requested retry",
-
-    "TOO FREQUENT":
-        "Rate limited",
-
-    "USER INFO ERROR":
-        "Wrong state",
-
-    "ROLE NOT EXIST":
-        "Player does not exist",
-
-    "STOVE_LV ERROR":
-        "Furnace level too low",
-
-    "RECHARGE_MONEY ERROR":
-        "Spending requirement not met",
-
-    "RECHARGE_MONEY_VIP ERROR":
-        "VIP requirement not met",
-
-    "SIGN ERROR":
-        "Request signature error",
-
-    "NOT LOGIN":
-        "Server rejected request"
-}
-
-
-SUCCESS_STATUSES = (
-    "SUCCESS",
-    "SAME TYPE EXCHANGE"
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
 )
 
 
-FATAL_STATUSES = (
-    "TIME ERROR",
-    "CDK NOT FOUND",
-    "USED"
-)
+# Prevent two redemption jobs running simultaneously.
+redemption_lock = asyncio.Lock()
 
 
 # ============================================================
-# SIGN REQUEST
+# TIME HELPERS
+# ============================================================
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ============================================================
+# WOS SIGNING
 # ============================================================
 
 def encode_data(data):
+    """
+    Sign request payload using the format expected by
+    the current WOS gift-code API.
+    """
 
     sorted_keys = sorted(data.keys())
 
@@ -174,13 +141,8 @@ def encode_data(data):
         for key in sorted_keys
     )
 
-    sign_string = (
-        encoded +
-        WOS_ENCRYPT_KEY
-    )
-
     sign = hashlib.md5(
-        sign_string.encode()
+        f"{encoded}{WOS_ENCRYPT_KEY}".encode()
     ).hexdigest()
 
     return {
@@ -190,121 +152,174 @@ def encode_data(data):
 
 
 # ============================================================
-# CLASSIFY WOS RESPONSE
+# WOS RESPONSE CLASSIFICATION
 # ============================================================
 
 def classify_response(data):
 
-    msg = str(
-        data.get(
-            "msg",
-            "UNKNOWN"
-        )
+    message = str(
+        data.get("msg", "UNKNOWN")
     ).strip(".")
 
-    err_code = data.get(
-        "err_code"
+    error_code = data.get("err_code")
+
+    if message == "SUCCESS":
+        return "success", "Successfully redeemed"
+
+    if message == "SAME TYPE EXCHANGE" and error_code == 40011:
+        return "success", "Successfully redeemed"
+
+    if message == "RECEIVED" and error_code == 40008:
+        return "already_redeemed", "Already redeemed"
+
+    if message == "TIME ERROR" and error_code == 40007:
+        return "expired", "Code has expired"
+
+    if message == "CDK NOT FOUND" and error_code == 40014:
+        return "invalid", "Gift code not found"
+
+    if message == "USED" and error_code == 40005:
+        return "claim_limit", "Claim limit reached"
+
+    if message == "TOO FREQUENT" and error_code == 40019:
+        return "rate_limited", "Rate limited"
+
+    if message == "USER INFO ERROR" and error_code == 40020:
+        return "wrong_state", "Wrong state for player"
+
+    if error_code == 40001 and "not exist" in message.lower():
+        return "player_not_found", "Player does not exist"
+
+    if message == "STOVE_LV ERROR" and error_code == 40006:
+        return "furnace_too_low", "Furnace level too low"
+
+    if message == "RECHARGE_MONEY ERROR" and error_code == 40017:
+        return "spending_requirement", "Spending requirement not met"
+
+    if message == "RECHARGE_MONEY_VIP ERROR" and error_code == 40018:
+        return "vip_requirement", "VIP requirement not met"
+
+    if message == "TIMEOUT RETRY" and error_code == 40004:
+        return "retry", "Server requested retry"
+
+    if "sign error" in message.lower():
+        return "sign_error", "Request signature rejected"
+
+    return "failed", f"{message} ({error_code})"
+
+
+# ============================================================
+# REDEEM ONE REQUEST
+# ============================================================
+
+def redeem_request(fid, state, code):
+
+    payload = encode_data({
+        "fid": str(fid),
+        "cdk": code,
+        "kid": str(state),
+        "time": str(int(time.time()))
+    })
+
+    last_error = None
+
+    for attempt in range(1, MAX_HTTP_RETRIES + 1):
+
+        try:
+
+            response = session.post(
+                REDEEM_URL,
+                data=payload,
+                timeout=HTTP_TIMEOUT
+            )
+
+            if response.status_code == 429:
+
+                last_error = "HTTP 429"
+
+                time.sleep(
+                    2 * attempt
+                )
+
+                continue
+
+            if response.status_code in (
+                502,
+                503,
+                504
+            ):
+
+                last_error = (
+                    f"HTTP {response.status_code}"
+                )
+
+                time.sleep(
+                    2 * attempt
+                )
+
+                continue
+
+            if response.status_code != 200:
+
+                return (
+                    "failed",
+                    f"HTTP {response.status_code}"
+                )
+
+            try:
+                data = response.json()
+
+            except ValueError:
+
+                return (
+                    "failed",
+                    "Invalid JSON response"
+                )
+
+            return classify_response(data)
+
+        except requests.RequestException as exc:
+
+            last_error = str(exc)
+
+            if attempt < MAX_HTTP_RETRIES:
+                time.sleep(2 * attempt)
+
+    return (
+        "failed",
+        last_error or "Request failed"
     )
 
-    if msg == "SUCCESS":
-        return "SUCCESS"
 
-    if (
-        msg == "RECEIVED"
-        and err_code == 40008
-    ):
-        return "RECEIVED"
+# ============================================================
+# ASYNC WRAPPER
+# ============================================================
 
-    if (
-        msg == "SAME TYPE EXCHANGE"
-        and err_code == 40011
-    ):
-        return "SAME TYPE EXCHANGE"
+async def redeem_request_async(
+    fid,
+    state,
+    code
+):
 
-    if (
-        msg == "TIME ERROR"
-        and err_code == 40007
-    ):
-        return "TIME ERROR"
-
-    if (
-        msg == "CDK NOT FOUND"
-        and err_code == 40014
-    ):
-        return "CDK NOT FOUND"
-
-    if (
-        msg == "USED"
-        and err_code == 40005
-    ):
-        return "USED"
-
-    if (
-        msg == "TIMEOUT RETRY"
-        and err_code == 40004
-    ):
-        return "TIMEOUT RETRY"
-
-    if (
-        msg == "TOO FREQUENT"
-        and err_code == 40019
-    ):
-        return "TOO FREQUENT"
-
-    if (
-        msg == "USER INFO ERROR"
-        and err_code == 40020
-    ):
-        return "USER INFO ERROR"
-
-    if (
-        err_code == 40001
-        and "not exist" in msg.lower()
-    ):
-        return "ROLE NOT EXIST"
-
-    if (
-        msg == "STOVE_LV ERROR"
-        and err_code == 40006
-    ):
-        return "STOVE_LV ERROR"
-
-    if (
-        msg == "RECHARGE_MONEY ERROR"
-        and err_code == 40017
-    ):
-        return "RECHARGE_MONEY ERROR"
-
-    if (
-        msg == "RECHARGE_MONEY_VIP ERROR"
-        and err_code == 40018
-    ):
-        return "RECHARGE_MONEY_VIP ERROR"
-
-    if "sign error" in msg.lower():
-        return "SIGN ERROR"
-
-    if msg == "NOT LOGIN":
-        return "NOT LOGIN"
-
-    return msg
+    return await asyncio.to_thread(
+        redeem_request,
+        fid,
+        state,
+        code
+    )
 
 
 # ============================================================
-# GET COD PLAYERS
+# LOAD ACTIVE COD PLAYERS
 # ============================================================
 
-def get_cod_players():
+def load_cod_players():
 
     response = (
         supabase
-        .table("players")
+        .table(PLAYERS_TABLE)
         .select(
-            "fid,"
-            "player_name,"
-            "alliance,"
-            "state,"
-            "active"
+            "fid,player_name,alliance,state,active"
         )
         .eq(
             "alliance",
@@ -330,130 +345,101 @@ def get_cod_players():
             continue
 
         if not state:
-            print(
-                f"Skipping {fid}: "
-                "no state recorded"
-            )
-
             continue
 
-        valid_players.append(
-            player
-        )
+        valid_players.append(player)
 
     return valid_players
 
 
 # ============================================================
-# REDEEM ONCE
-# ============================================================
-
-def redeem_once(
-    fid,
-    state,
-    code
-):
-
-    payload = encode_data({
-
-        "fid":
-            str(fid),
-
-        "cdk":
-            code,
-
-        "kid":
-            str(state),
-
-        "time":
-            str(
-                int(
-                    time.time()
-                )
-            )
-    })
-
-    for attempt in range(
-        MAX_TRANSPORT_RETRIES
-    ):
-
-        try:
-
-            response = session.post(
-                REDEEM_URL,
-                data=payload,
-                timeout=(10, 30)
-            )
-
-            if response.status_code == 200:
-
-                data = response.json()
-
-                return classify_response(
-                    data
-                )
-
-            if response.status_code in (
-                429,
-                502,
-                503,
-                504
-            ):
-
-                time.sleep(
-                    2 * (
-                        attempt + 1
-                    )
-                )
-
-                continue
-
-            return (
-                f"HTTP "
-                f"{response.status_code}"
-            )
-
-        except requests.RequestException:
-
-            if (
-                attempt
-                <
-                MAX_TRANSPORT_RETRIES - 1
-            ):
-
-                time.sleep(
-                    2 * (
-                        attempt + 1
-                    )
-                )
-
-                continue
-
-            return "TRANSPORT ERROR"
-
-        except ValueError:
-
-            return "INVALID RESPONSE"
-
-    return "TRANSPORT ERROR"
-
-
-# ============================================================
-# DATABASE HELPERS
+# CREATE / GET GIFT CODE
 # ============================================================
 
 def get_existing_code(code):
 
-    result = (
+    response = (
         supabase
-        .table(
-            "gift_codes"
-        )
+        .table(CODES_TABLE)
         .select("*")
         .eq(
             "code",
             code
         )
+        .limit(1)
+        .execute()
+    )
+
+    if response.data:
+        return response.data[0]
+
+    return None
+
+
+def create_code(
+    code,
+    user
+):
+
+    result = (
+        supabase
+        .table(CODES_TABLE)
+        .insert({
+            "code": code,
+            "status": "pending",
+            "submitted_by": str(user),
+            "submitted_by_id": str(user.id),
+            "created_at": utc_now()
+        })
+        .execute()
+    )
+
+    return result.data[0]
+
+
+# ============================================================
+# UPDATE GIFT CODE
+# ============================================================
+
+def update_code(
+    gift_code_id,
+    values
+):
+
+    (
+        supabase
+        .table(CODES_TABLE)
+        .update(values)
+        .eq(
+            "id",
+            gift_code_id
+        )
+        .execute()
+    )
+
+
+# ============================================================
+# GET EXISTING REDEMPTION
+# ============================================================
+
+def get_redemption(
+    code,
+    fid
+):
+
+    result = (
+        supabase
+        .table(REDEMPTIONS_TABLE)
+        .select("*")
+        .eq(
+            "code",
+            code
+        )
+        .eq(
+            "fid",
+            fid
+        )
+        .limit(1)
         .execute()
     )
 
@@ -463,585 +449,449 @@ def get_existing_code(code):
     return None
 
 
-def create_gift_code(
-    code,
-    user
-):
-
-    result = (
-        supabase
-        .table(
-            "gift_codes"
-        )
-        .insert({
-
-            "code":
-                code,
-
-            "status":
-                "pending",
-
-            "submitted_by":
-                str(user),
-
-            "submitted_by_id":
-                str(user.id)
-
-        })
-        .execute()
-    )
-
-    return result.data[0]
-
-
-def update_gift_code(
-    gift_id,
-    values
-):
-
-    (
-        supabase
-        .table(
-            "gift_codes"
-        )
-        .update(
-            values
-        )
-        .eq(
-            "id",
-            gift_id
-        )
-        .execute()
-    )
-
+# ============================================================
+# SAVE REDEMPTION
+# ============================================================
 
 def save_redemption(
-    gift_id,
+    gift_code_id,
     code,
     player,
     status,
+    message,
     attempts
 ):
 
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    now = utc_now()
 
-    friendly = RESULT_MESSAGES.get(
-        status,
-        status
+    existing = get_redemption(
+        code,
+        player["fid"]
     )
 
     values = {
-
-        "gift_code_id":
-            gift_id,
-
-        "code":
-            code,
-
-        "fid":
-            int(
-                player["fid"]
-            ),
-
-        "player_name":
-            player.get(
-                "player_name"
-            ),
-
-        "alliance":
-            player.get(
-                "alliance"
-            ),
-
-        "state":
-            int(
-                player["state"]
-            ),
-
-        "status":
-            status,
-
-        "message":
-            friendly,
-
-        "attempts":
-            attempts,
-
-        "last_attempt_at":
-            now
+        "gift_code_id": gift_code_id,
+        "code": code,
+        "fid": player["fid"],
+        "player_name": player.get(
+            "player_name"
+        ),
+        "alliance": player.get(
+            "alliance"
+        ),
+        "state": player["state"],
+        "status": status,
+        "message": message,
+        "attempts": attempts,
+        "last_attempt_at": now
     }
 
-    if status in SUCCESS_STATUSES:
+    if status == "success":
+        values["redeemed_at"] = now
 
-        values[
-            "redeemed_at"
-        ] = now
-
-    existing = (
-        supabase
-        .table(
-            "gift_code_redemptions"
-        )
-        .select(
-            "id,"
-            "first_attempt_at"
-        )
-        .eq(
-            "code",
-            code
-        )
-        .eq(
-            "fid",
-            int(
-                player["fid"]
-            )
-        )
-        .execute()
-    )
-
-    if existing.data:
+    if existing:
 
         (
             supabase
-            .table(
-                "gift_code_redemptions"
-            )
-            .update(
-                values
-            )
+            .table(REDEMPTIONS_TABLE)
+            .update(values)
             .eq(
                 "id",
-                existing.data[0]["id"]
+                existing["id"]
             )
             .execute()
         )
 
     else:
 
-        values[
-            "first_attempt_at"
-        ] = now
+        values["first_attempt_at"] = now
+        values["created_at"] = now
 
         (
             supabase
-            .table(
-                "gift_code_redemptions"
-            )
-            .insert(
-                values
-            )
+            .table(REDEMPTIONS_TABLE)
+            .insert(values)
             .execute()
         )
 
 
 # ============================================================
-# BUILD DISCORD EMBED
+# DISCORD EMBED
 # ============================================================
 
-def progress_embed(
+def make_progress_embed(
     code,
     total,
     processed,
-    success,
-    received,
+    successful,
+    already,
+    failed,
     wrong_state,
-    failed
+    rate_limited=0
 ):
 
     embed = discord.Embed(
         title="🎁 COD Gift Code Redeemer",
-        description=f"`{code}`"
+        description=f"**Code:** `{code}`"
     )
 
     embed.add_field(
         name="Progress",
-        value=(
-            f"{processed} / "
-            f"{total}"
-        ),
+        value=f"{processed} / {total}",
         inline=False
     )
 
     embed.add_field(
         name="✅ Redeemed",
-        value=str(success)
+        value=str(successful),
+        inline=True
     )
 
     embed.add_field(
         name="☑️ Already",
-        value=str(received)
-    )
-
-    embed.add_field(
-        name="⚠️ Wrong State",
-        value=str(wrong_state)
+        value=str(already),
+        inline=True
     )
 
     embed.add_field(
         name="❌ Failed",
-        value=str(failed)
+        value=str(failed),
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚠️ Wrong State",
+        value=str(wrong_state),
+        inline=True
+    )
+
+    embed.add_field(
+        name="⏳ Cooling Down",
+        value=str(rate_limited),
+        inline=True
     )
 
     return embed
 
 
 # ============================================================
-# PROCESS CODE
+# MAIN REDEMPTION JOB
 # ============================================================
 
 async def process_code(
     interaction,
     code,
-    gift
+    retry_failures=False
 ):
 
-    gift_id = gift["id"]
+    code = code.strip()
 
     players = await asyncio.to_thread(
-        get_cod_players
+        load_cod_players
     )
 
-    total = len(players)
-
-    if total == 0:
+    if not players:
 
         await interaction.edit_original_response(
             content=(
-                "❌ No active COD players "
-                "were found."
-            )
-        )
-
-        update_gift_code(
-            gift_id,
-            {
-                "status": "failed",
-                "failed": 0,
-                "total_players": 0
-            }
+                "❌ No active COD players with a valid "
+                "FID and state were found."
+            ),
+            embed=None
         )
 
         return
 
-    update_gift_code(
-        gift_id,
+    existing_code = await asyncio.to_thread(
+        get_existing_code,
+        code
+    )
+
+    if existing_code:
+
+        gift_code = existing_code
+
+    else:
+
+        gift_code = await asyncio.to_thread(
+            create_code,
+            code,
+            interaction.user
+        )
+
+    gift_code_id = gift_code["id"]
+
+    await asyncio.to_thread(
+        update_code,
+        gift_code_id,
         {
-
-            "status":
-                "processing",
-
-            "total_players":
-                total,
-
-            "started_at":
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-
+            "status": "processing",
+            "total_players": len(players),
+            "started_at": utc_now()
         }
     )
 
-    success = 0
-    received = 0
-    wrong_state = 0
+    successful = 0
+    already = 0
     failed = 0
+    wrong_state = 0
     processed = 0
 
-    cooldowns = {}
+    cooldown_queue = []
 
-    queue = list(players)
+    # ========================================================
+    # FIRST PASS
+    # ========================================================
 
-    last_update = 0
+    for player in players:
 
-    while queue:
+        fid = player["fid"]
 
-        player = queue.pop(0)
-
-        fid = str(
-            player["fid"]
+        existing = await asyncio.to_thread(
+            get_redemption,
+            code,
+            fid
         )
 
-        state = int(
-            player["state"]
-        )
+        # Don't hit WOS again for completed players.
+        if (
+            existing
+            and not retry_failures
+            and existing.get("status")
+            in (
+                "success",
+                "already_redeemed"
+            )
+        ):
 
-        attempts = (
-            cooldowns.get(
+            if existing["status"] == "success":
+                successful += 1
+            else:
+                already += 1
+
+            processed += 1
+            continue
+
+        status, message = (
+            await redeem_request_async(
                 fid,
-                0
+                player["state"],
+                code
             )
-            + 1
         )
 
-        status = await asyncio.to_thread(
-            redeem_once,
-            fid,
-            state,
-            code
-        )
+        # --------------------------------------------
+        # RATE LIMITED
+        # --------------------------------------------
 
-        # ----------------------------------------
-        # RATE LIMIT
-        # ----------------------------------------
+        if status == "rate_limited":
 
-        if status == "TOO FREQUENT":
-
-            cooldowns[fid] = (
-                cooldowns.get(
-                    fid,
-                    0
-                )
-                + 1
-            )
-
-            if (
-                cooldowns[fid]
-                <=
-                MAX_COOLDOWNS
-            ):
-
-                await asyncio.sleep(
-                    TOO_FREQUENT_DELAY
-                )
-
-                queue.append(
-                    player
-                )
-
-                continue
-
-            failed += 1
-            processed += 1
-
-        # ----------------------------------------
-        # SUCCESS
-        # ----------------------------------------
-
-        elif status in SUCCESS_STATUSES:
-
-            success += 1
-            processed += 1
-
-        # ----------------------------------------
-        # ALREADY REDEEMED
-        # ----------------------------------------
-
-        elif status == "RECEIVED":
-
-            received += 1
-            processed += 1
-
-        # ----------------------------------------
-        # WRONG STATE
-        # ----------------------------------------
-
-        elif status == "USER INFO ERROR":
-
-            wrong_state += 1
-            processed += 1
-
-        # ----------------------------------------
-        # FATAL CODE ERROR
-        # ----------------------------------------
-
-        elif status in FATAL_STATUSES:
-
-            failed += 1
-            processed += 1
+            cooldown_queue.append({
+                "player": player,
+                "attempts": 1
+            })
 
             await asyncio.to_thread(
                 save_redemption,
-                gift_id,
+                gift_code_id,
                 code,
                 player,
                 status,
-                attempts
+                message,
+                1
             )
 
-            break
+            continue
 
-        # ----------------------------------------
-        # OTHER ERROR
-        # ----------------------------------------
-
-        else:
-
-            failed += 1
-            processed += 1
+        # --------------------------------------------
+        # SAVE
+        # --------------------------------------------
 
         await asyncio.to_thread(
             save_redemption,
-            gift_id,
+            gift_code_id,
             code,
             player,
             status,
-            attempts
+            message,
+            1
         )
 
-        # ----------------------------------------
-        # UPDATE DISCORD EVERY ~10 PLAYERS
-        # ----------------------------------------
+        processed += 1
 
-        if (
-            processed - last_update >= 10
-            or processed == total
+        if status == "success":
+            successful += 1
+
+        elif status == "already_redeemed":
+            already += 1
+
+        elif status == "wrong_state":
+            wrong_state += 1
+
+        else:
+            failed += 1
+
+        # --------------------------------------------
+        # GLOBAL BAD CODE
+        # --------------------------------------------
+
+        if status in (
+            "expired",
+            "invalid",
+            "claim_limit"
         ):
 
-            last_update = processed
-
-            embed = progress_embed(
-                code,
-                total,
-                processed,
-                success,
-                received,
-                wrong_state,
-                failed
+            await asyncio.to_thread(
+                update_code,
+                gift_code_id,
+                {
+                    "status": status,
+                    "successful": successful,
+                    "already_redeemed": already,
+                    "failed": failed,
+                    "wrong_state": wrong_state,
+                    "completed_at": utc_now()
+                }
             )
 
-            try:
-
-                await interaction.edit_original_response(
-                    embed=embed,
-                    content=None
+            await interaction.edit_original_response(
+                content=None,
+                embed=discord.Embed(
+                    title="🎁 Gift Code Stopped",
+                    description=(
+                        f"**Code:** `{code}`\n\n"
+                        f"⚠️ {message}\n\n"
+                        "Remaining COD players were not "
+                        "processed."
+                    )
                 )
+            )
 
-            except discord.HTTPException:
-                pass
+            return
+
+        # Update Discord periodically
+        if processed % 10 == 0:
+
+            await interaction.edit_original_response(
+                content=None,
+                embed=make_progress_embed(
+                    code,
+                    len(players),
+                    processed,
+                    successful,
+                    already,
+                    failed,
+                    wrong_state,
+                    len(cooldown_queue)
+                )
+            )
 
         await asyncio.sleep(
             PLAYER_DELAY
         )
 
-
     # ========================================================
-    # FINAL STATUS
+    # RATE-LIMIT RETRIES
     # ========================================================
 
-    completed_at = datetime.now(
-        timezone.utc
-    ).isoformat()
+    for retry_round in range(
+        MAX_RATE_LIMIT_RETRIES
+    ):
 
-    update_gift_code(
-        gift_id,
-        {
-
-            "status":
-                "completed",
-
-            "successful":
-                success,
-
-            "already_redeemed":
-                received,
-
-            "wrong_state":
-                wrong_state,
-
-            "failed":
-                failed,
-
-            "completed_at":
-                completed_at
-
-        }
-    )
-
-    embed = discord.Embed(
-        title="🎁 COD Gift Code Complete",
-        description=f"`{code}`"
-    )
-
-    embed.add_field(
-        name="👥 COD Players",
-        value=str(total),
-        inline=False
-    )
-
-    embed.add_field(
-        name="✅ Redeemed",
-        value=str(success)
-    )
-
-    embed.add_field(
-        name="☑️ Already Redeemed",
-        value=str(received)
-    )
-
-    embed.add_field(
-        name="⚠️ Wrong State",
-        value=str(wrong_state)
-    )
-
-    embed.add_field(
-        name="❌ Failed",
-        value=str(failed)
-    )
-
-    await interaction.edit_original_response(
-        content=None,
-        embed=embed
-    )
-
-
-# ============================================================
-# /GIFTCODE
-# ============================================================
-
-@bot.tree.command(
-    name="giftcode",
-    description="Redeem a WOS gift code for active COD members."
-)
-@app_commands.describe(
-    code="Whiteout Survival gift code"
-)
-async def giftcode(
-    interaction: discord.Interaction,
-    code: str
-):
-
-    code = code.strip()
-
-    if not code:
-
-        await interaction.response.send_message(
-            "❌ Enter a gift code.",
-            ephemeral=True
-        )
-
-        return
-
-    await interaction.response.defer()
-
-    existing = await asyncio.to_thread(
-        get_existing_code,
-        code
-    )
-
-    if existing:
+        if not cooldown_queue:
+            break
 
         await interaction.edit_original_response(
-            content=(
-                "⚠️ This code is already "
-                "in the database.\n\n"
-                f"Status: `{existing['status']}`"
+            content=None,
+            embed=discord.Embed(
+                title="⏳ WOS Cooldown",
+                description=(
+                    f"`{code}`\n\n"
+                    f"{len(cooldown_queue)} player(s) were "
+                    "rate limited.\n\n"
+                    f"Waiting {RATE_LIMIT_WAIT} seconds "
+                    "before retrying them."
+                )
             )
         )
 
-        return
-
-    gift = await asyncio.to_thread(
-        create_gift_code,
-        code,
-        interaction.user
-    )
-
-    await interaction.edit_original_response(
-        content=(
-            "🎁 Loading active COD players..."
+        await asyncio.sleep(
+            RATE_LIMIT_WAIT
         )
-    )
 
-    await process
+        next_queue = []
+
+        for item in cooldown_queue:
+
+            player = item["player"]
+
+            attempts = (
+                item["attempts"] + 1
+            )
+
+            status, message = (
+                await redeem_request_async(
+                    player["fid"],
+                    player["state"],
+                    code
+                )
+            )
+
+            await asyncio.to_thread(
+                save_redemption,
+                gift_code_id,
+                code,
+                player,
+                status,
+                message,
+                attempts
+            )
+
+            if status == "rate_limited":
+
+                next_queue.append({
+                    "player": player,
+                    "attempts": attempts
+                })
+
+            else:
+
+                processed += 1
+
+                if status == "success":
+                    successful += 1
+
+                elif status == "already_redeemed":
+                    already += 1
+
+                elif status == "wrong_state":
+                    wrong_state += 1
+
+                else:
+                    failed += 1
+
+            await asyncio.sleep(
+                PLAYER_DELAY
+            )
+
+        cooldown_queue = next_queue
+
+    # Anything still cooling down counts as failure.
+    if cooldown_queue:
+
+        failed += len(cooldown_queue)
+        processed += len(cooldown_queue)
+
+    # ========================================================
+    # FINISH
+    # ========================================================
+
+    await asyncio.to_thread(
+        update_code,
+        gift_code_id,
+        {
+            "status": "completed",
+            "total_players": len(players),
+            "successful": successful,
+            "already_redeemed": already,
+            "failed": failed
