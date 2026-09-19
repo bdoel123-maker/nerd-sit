@@ -48,7 +48,7 @@ if not SUPABASE_KEY:
 # CONFIG
 # ============================================================
 
-ALLIANCE = "COD"
+GIFT_ALLIANCES = ("COD", "llc")
 
 DEFAULT_STATE = 2348
 
@@ -411,16 +411,15 @@ def create_gift_code(code):
 
 
 # ============================================================
-# LOAD COD PLAYERS
+# LOAD PLAYERS BY ALLIANCE
 # ============================================================
 
-def get_cod_players():
+def get_alliance_players(alliance):
 
     log(
-        "Loading active COD players "
+        f"Loading active {alliance} players "
         "from Supabase..."
     )
-
 
     response = (
         supabase
@@ -432,14 +431,8 @@ def get_cod_players():
             "state,"
             "active"
         )
-        .eq(
-            "alliance",
-            ALLIANCE
-        )
-        .eq(
-            "active",
-            True
-        )
+        .eq("alliance", alliance)
+        .eq("active", True)
         .execute()
     )
 
@@ -506,7 +499,7 @@ def get_cod_players():
                 f"Player {fid}",
 
             "alliance":
-                ALLIANCE,
+                alliance,
 
             "state":
                 state,
@@ -528,7 +521,7 @@ def get_cod_players():
 
     log(
         f"Loaded {len(result)} "
-        "active COD player(s)."
+        f"active {alliance} player(s)."
     )
 
 
@@ -1170,7 +1163,8 @@ def update_gift_code_summary(
 
 def process_gift_code(
     gift_code,
-    players
+    players,
+    send_discord=True
 ):
 
     code = gift_code["code"]
@@ -1456,16 +1450,17 @@ def process_gift_code(
             )
 
 
-            post_summary(
-                code,
-                status,
-                len(players),
-                processed,
-                successful,
-                already_redeemed,
-                failed,
-                wrong_state
-            )
+            if send_discord:
+                post_summary(
+                    code,
+                    status,
+                    len(players),
+                    processed,
+                    successful,
+                    already_redeemed,
+                    failed,
+                    wrong_state
+                )
 
 
             return
@@ -1497,16 +1492,17 @@ def process_gift_code(
     )
 
 
-    post_summary(
-        code,
-        "completed",
-        len(players),
-        processed,
-        successful,
-        already_redeemed,
-        failed,
-        wrong_state
-    )
+    if send_discord:
+        post_summary(
+            code,
+            "completed",
+            len(players),
+            processed,
+            successful,
+            already_redeemed,
+            failed,
+            wrong_state
+        )
 
 
 # ============================================================
@@ -1654,117 +1650,77 @@ def get_codes_to_process():
 
 def main():
 
-    log(
-        "COD WOS Gift Code Redeemer starting..."
-    )
-
+    log("COD + llc WOS Gift Code Redeemer starting...")
 
     try:
+        cod_players = get_alliance_players("COD")
+        llc_players = get_alliance_players("llc")
 
-        players = get_cod_players()
-
-
-        if not players:
-
-            log(
-                "No active COD players found. "
-                "Nothing to redeem."
-            )
-
+        if not cod_players and not llc_players:
+            log("No active COD or llc players found. Nothing to redeem.")
             discord_message(
                 "⚠️ **COD Gift Code Redeemer**\n\n"
-                "No active COD players were found "
-                "in Supabase."
+                "No active COD players were found in Supabase."
             )
-
             return
 
+        # Discover active codes directly. A code may already be marked completed
+        # for COD while a newly-added llc player still needs it.
+        discovered = discover_gift_codes()
 
-        codes = get_codes_to_process()
-
-
-        if not codes:
-
-            log(
-                "No new gift codes to process."
-            )
-
+        if not discovered:
+            log("No active gift codes discovered.")
             return
 
+        gift_codes = []
+        for code in discovered:
+            existing = get_existing_code(code)
+            if existing:
+                gift_codes.append(existing)
+            else:
+                gift_codes.append(create_gift_code(code))
 
-        log(
-            f"{len(codes)} gift code(s) "
-            "queued for processing."
-        )
+        log(f"{len(gift_codes)} active gift code(s) available for processing.")
 
+        for gift_code in gift_codes:
+            code = gift_code.get("code", "UNKNOWN")
 
-        for gift_code in codes:
-
-            try:
-
-                process_gift_code(
-                    gift_code,
-                    players
-                )
-
-            except Exception as exc:
-
-                code = gift_code.get(
-                    "code",
-                    "UNKNOWN"
-                )
-
-                log(
-                    f"Fatal error processing "
-                    f"{code}: {exc}"
-                )
-
-
+            if cod_players:
+                log(f"Starting COD redemption pass for {code}.")
                 try:
-
-                    update_gift_code_summary(
-                        gift_code["id"],
-                        "failed",
-                        len(players),
-                        0,
-                        0,
-                        1,
-                        0
+                    process_gift_code(
+                        gift_code,
+                        cod_players,
+                        send_discord=True
+                    )
+                except Exception as exc:
+                    log(f"COD error processing {code}: {exc}")
+                    discord_message(
+                        "❌ **COD Gift Code Error**\n\n"
+                        f"Code: `{code}`\n"
+                        f"Error: `{str(exc)[:500]}`"
                     )
 
-                except Exception as db_exc:
-
-                    log(
-                        "Could not update failed "
-                        f"gift code: {db_exc}"
+            if llc_players:
+                log(f"Starting llc redemption pass for {code}.")
+                try:
+                    process_gift_code(
+                        gift_code,
+                        llc_players,
+                        send_discord=False
                     )
+                except Exception as exc:
+                    # llc errors stay in the Actions log only.
+                    log(f"llc error processing {code}: {exc}")
 
-
-                discord_message(
-                    "❌ **COD Gift Code Error**\n\n"
-                    f"Code: `{code}`\n"
-                    f"Error: `{str(exc)[:500]}`"
-                )
-
-
-        log(
-            "COD WOS Gift Code Redeemer finished."
-        )
-
+        log("COD + llc WOS Gift Code Redeemer finished.")
 
     except Exception as exc:
-
-        log(
-            f"Fatal application error: {exc}"
-        )
-
-
+        log(f"Fatal application error: {exc}")
         discord_message(
             "❌ **COD Gift Code Redeemer Failed**\n\n"
             f"`{str(exc)[:1000]}`"
         )
-
-
         raise
 
 
