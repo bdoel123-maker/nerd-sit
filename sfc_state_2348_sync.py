@@ -83,6 +83,9 @@ MAX_RETRIES = 3
 
 SUPABASE_BATCH_SIZE = 100
 
+# Existing SFC roster table. Power updates match by FID and do not insert rows.
+SUNFIRE_TABLE = "sunfire_players"
+
 
 # ============================================================
 # STANDINGS BOARD TYPES
@@ -1498,6 +1501,74 @@ def mark_players_no_longer_in_state_inactive(state_player_ids):
 
 
 # ============================================================
+# UPDATE CURRENT POWER IN SUNFIRE PLAYERS
+# ============================================================
+
+def update_sunfire_current_power(rows):
+    """Update only the power column for existing SFC roster rows by FID."""
+    if not rows:
+        return True, 0
+
+    endpoint = f"{SUPABASE_URL}/rest/v1/{SUNFIRE_TABLE}"
+    headers = dict(SUPABASE_HEADERS)
+    headers["Prefer"] = "return=representation"
+    success = True
+    updated_count = 0
+
+    print()
+    print("========================================")
+    print("      UPDATING SFC CURRENT POWER")
+    print("========================================")
+
+    for row in rows:
+        alliance = str(row.get("alliance", "")).strip()
+        if alliance not in TARGET_ALLIANCES:
+            continue
+
+        fid = row.get("fid")
+        power = row.get("power")
+        name = row.get("player") or "Unknown"
+
+        if fid is None or power is None:
+            print(f"SKIP: {name} | {fid} | current power unavailable")
+            continue
+
+        try:
+            response = requests.patch(
+                endpoint,
+                headers=headers,
+                params={"fid": f"eq.{fid}"},
+                json={"power": power},
+                timeout=30,
+            )
+        except requests.RequestException as error:
+            print(f"SFC POWER ERROR: {name} | {fid} | {error}")
+            success = False
+            continue
+
+        if not 200 <= response.status_code < 300:
+            print(f"SFC POWER ERROR: {name} | {fid} | HTTP {response.status_code}")
+            print(response.text)
+            success = False
+            continue
+
+        try:
+            matched = response.json()
+        except ValueError:
+            matched = []
+
+        if matched:
+            updated_count += len(matched)
+            print(f"SFC POWER: {name} | {fid} | {alliance} | {int(power):,}")
+        else:
+            print(f"NOT ON SFC ROSTER: {name} | {fid} | {alliance}")
+
+    print()
+    print(f"Sunfire roster rows updated: {updated_count}")
+    return success, updated_count
+
+
+# ============================================================
 # FETCH + SAVE ALL PLAYERS
 # ============================================================
 
@@ -1508,6 +1579,7 @@ def fetch_and_save_players(players):
     successful_profiles = 0
     failed_profiles = []
     database_failures = 0
+    all_database_rows = []
 
 
     print()
@@ -1633,6 +1705,9 @@ def fetch_and_save_players(players):
                 # =============================================
 
                 database_rows.append(
+                    row
+                )
+                all_database_rows.append(
                     row
                 )
 
@@ -1782,6 +1857,7 @@ def fetch_and_save_players(players):
     return (
         failed_profiles,
         database_failures,
+        all_database_rows,
     )
 
 
@@ -1847,10 +1923,31 @@ def main():
     (
         failed_profiles,
         database_failures,
+        fetched_rows,
 
     ) = fetch_and_save_players(
         players
     )
+
+
+    # ========================================================
+    # UPDATE CURRENT POWER IN EXISTING SFC ROSTER
+    # ========================================================
+
+    sunfire_power_success = True
+    sunfire_power_updated = 0
+
+    if database_failures == 0:
+        (
+            sunfire_power_success,
+            sunfire_power_updated,
+        ) = update_sunfire_current_power(fetched_rows)
+    else:
+        print()
+        print(
+            "Skipping SFC power update because "
+            "one or more player database batches failed."
+        )
 
 
     # ========================================================
@@ -1944,6 +2041,16 @@ def main():
         raise SystemExit(1)
 
 
+    if not sunfire_power_success:
+
+        print()
+        print(
+            "One or more SFC current-power updates failed."
+        )
+
+        raise SystemExit(1)
+
+
     if not inactive_cleanup_success:
 
         print()
@@ -1954,6 +2061,12 @@ def main():
 
         raise SystemExit(1)
 
+
+    print()
+    print(
+        f"SFC power rows updated this run: "
+        f"{sunfire_power_updated}"
+    )
 
     print()
     print(
