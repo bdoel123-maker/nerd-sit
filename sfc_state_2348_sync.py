@@ -1504,50 +1504,114 @@ def mark_players_no_longer_in_state_inactive(state_player_ids):
 # UPDATE CURRENT POWER IN SUNFIRE PLAYERS
 # ============================================================
 
+def furnace_display(level):
+    """Convert raw furnace level to the FC display used by the SFC roster."""
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        return None
+
+    if 75 <= level <= 80:
+        return "FC10"
+    if 70 <= level <= 74:
+        return "FC9"
+    if 65 <= level <= 69:
+        return "FC8"
+    if 60 <= level <= 64:
+        return "FC7"
+    if 55 <= level <= 59:
+        return "FC6"
+    if 50 <= level <= 54:
+        return "FC5"
+    if 45 <= level <= 49:
+        return "FC4"
+    if 40 <= level <= 44:
+        return "FC3"
+    if 35 <= level <= 39:
+        return "FC2"
+    if 31 <= level <= 34:
+        return "FC1"
+
+    return str(level)
+
+
 def update_sunfire_current_power(rows):
-    """Update only the power column for existing SFC roster rows by FID."""
+    """
+    Refresh existing SFC roster rows by FID.
+
+    Updates:
+      - current player name
+      - alliance
+      - FC level
+      - current power
+
+    This does not insert or delete SFC roster rows.
+    """
     if not rows:
         return True, 0
 
     endpoint = f"{SUPABASE_URL}/rest/v1/{SUNFIRE_TABLE}"
     headers = dict(SUPABASE_HEADERS)
     headers["Prefer"] = "return=representation"
+
     success = True
     updated_count = 0
 
     print()
     print("========================================")
-    print("      UPDATING SFC CURRENT POWER")
+    print("        UPDATING SFC ROSTER DATA")
     print("========================================")
 
     for row in rows:
         alliance = str(row.get("alliance", "")).strip()
+
         if alliance not in TARGET_ALLIANCES:
             continue
 
         fid = row.get("fid")
         power = row.get("power")
-        name = row.get("player") or "Unknown"
+        name = row.get("player")
+        furnace_level = row.get("furnace_level")
 
-        if fid is None or power is None:
-            print(f"SKIP: {name} | {fid} | current power unavailable")
+        if fid is None:
             continue
+
+        payload = {
+            "alliance": alliance,
+        }
+
+        if name:
+            payload["player_name"] = name
+
+        if furnace_level is not None:
+            payload["fc_level"] = furnace_display(furnace_level)
+
+        if power is not None:
+            payload["power"] = power
 
         try:
             response = requests.patch(
                 endpoint,
                 headers=headers,
                 params={"fid": f"eq.{fid}"},
-                json={"power": power},
+                json=payload,
                 timeout=30,
             )
+
         except requests.RequestException as error:
-            print(f"SFC POWER ERROR: {name} | {fid} | {error}")
+            print(
+                f"SFC UPDATE ERROR: "
+                f"{name or 'Unknown'} | {fid} | {error}"
+            )
             success = False
             continue
 
         if not 200 <= response.status_code < 300:
-            print(f"SFC POWER ERROR: {name} | {fid} | HTTP {response.status_code}")
+            print(
+                f"SFC UPDATE ERROR: "
+                f"{name or 'Unknown'} | {fid} | "
+                f"HTTP {response.status_code}"
+            )
             print(response.text)
             success = False
             continue
@@ -1559,12 +1623,31 @@ def update_sunfire_current_power(rows):
 
         if matched:
             updated_count += len(matched)
-            print(f"SFC POWER: {name} | {fid} | {alliance} | {int(power):,}")
+
+            power_display = (
+                f"{int(power):,}"
+                if power is not None
+                else "UNCHANGED"
+            )
+
+            print(
+                f"SFC UPDATED: "
+                f"{name or 'Unknown'} "
+                f"| {fid} "
+                f"| {alliance} "
+                f"| {furnace_display(furnace_level)} "
+                f"| Power {power_display}"
+            )
+
         else:
-            print(f"NOT ON SFC ROSTER: {name} | {fid} | {alliance}")
+            print(
+                f"NOT ON SFC ROSTER: "
+                f"{name or 'Unknown'} | {fid} | {alliance}"
+            )
 
     print()
     print(f"Sunfire roster rows updated: {updated_count}")
+
     return success, updated_count
 
 
