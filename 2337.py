@@ -6,7 +6,7 @@ Whiteout Survival / WOSOracle enemy-state collector for SvS scouting.
 Required values, preferably stored in a .env file beside this script:
     WOSORACLE_API_TOKEN
     SUPABASE_URL
-    SUPABASE_SECRET_KEY
+    SUPABASE_KEY
 
 Examples:
     python enemy_svs_2337.py 2337
@@ -707,7 +707,7 @@ def main():
     args = parse_args()
 
     supabase_url = require_env("SUPABASE_URL")
-    supabase_key = require_env("SUPABASE_SECRET_KEY")
+    supabase_key = require_env("SUPABASE_KEY")
     db = SupabaseREST(supabase_url, supabase_key)
 
     if args.report:
