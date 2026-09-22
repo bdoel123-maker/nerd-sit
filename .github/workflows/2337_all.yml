@@ -27,6 +27,6 @@ jobs:
         env:
           WOSORACLE_API_TOKEN: ${{ secrets.WOSORACLE_API_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python 2337.py
