@@ -14,7 +14,7 @@ Examples:
     python enemy_svs_2337.py 2337 --update
     python enemy_svs_2337.py 2337 --discover
     python enemy_svs_2337.py 2337 --report
-    python enemy_svs_2337.py 2337 --top-alliances 8
+    python enemy_svs_2337.py 2337 --top-alliances 5
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def find_and_load_env() -> Path | None:
 ENV_FILE = find_and_load_env()
 
 WOS_BASE = "https://wosoracle.com"
-DEFAULT_TOP_ALLIANCES = 6
+DEFAULT_TOP_ALLIANCES = 5
 DEFAULT_BATCH_SIZE = 6
 DEFAULT_BATCH_DELAY = 15.0
 MAX_RETRIES = 5
