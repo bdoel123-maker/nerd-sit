@@ -234,6 +234,143 @@ class SupabaseREST:
         self.check(r, f"update FID {fid}")
 
 
+
+    def select_ranking_players(self):
+        r = self.session.get(
+            f"{self.base}/sunfire_players",
+            params={
+                "select": (
+                    "fid,player_name,power,pet_power,island_prosperity,"
+                    "hero_gear_power,expert_power,active"
+                ),
+                "active": "eq.true",
+            },
+            timeout=45,
+        )
+        self.check(r, "select Sunfire ranking data")
+        return r.json()
+
+    def patch_rank(self, fid, draft_score, draft_rank):
+        r = self.session.patch(
+            f"{self.base}/sunfire_players",
+            params={"fid": f"eq.{fid}"},
+            headers={"Prefer": "return=minimal"},
+            json={
+                "draft_score": draft_score,
+                "draft_rank": draft_rank,
+            },
+            timeout=45,
+        )
+        self.check(r, f"rank FID {fid}")
+
+
+def calculate_draft_rankings(db):
+    """
+    Weighted Sunfire draft score:
+      Pet Power          30%
+      Expert Power       25%
+      Hero Gear Power    20%
+      Island Prosperity  15%
+      Total Power        10%
+
+    Hero Power is intentionally ignored.
+
+    NULL handling:
+      For each metric, a NULL is scored as 90% of the lowest
+      non-NULL value in that metric. The database value itself
+      remains NULL.
+    """
+    weights = {
+        "pet_power": 0.30,
+        "expert_power": 0.25,
+        "hero_gear_power": 0.20,
+        "island_prosperity": 0.15,
+        "power": 0.10,
+    }
+
+    rows = db.select_ranking_players()
+    if not rows:
+        print("\nNo active players available for draft ranking.")
+        return
+
+    minimums = {}
+    maximums = {}
+    substitutes = {}
+
+    for metric in weights:
+        known = [
+            float(r[metric])
+            for r in rows
+            if r.get(metric) is not None
+        ]
+        if not known:
+            raise RuntimeError(
+                f"Cannot rank: every player has NULL {metric}"
+            )
+        minimums[metric] = min(known)
+        maximums[metric] = max(known)
+        substitutes[metric] = minimums[metric] * 0.90
+
+    print("\nDraft ranking NULL substitutes:")
+    for metric in weights:
+        print(
+            f"  {metric:20} "
+            f"min={minimums[metric]:,.0f} "
+            f"NULL score value={substitutes[metric]:,.0f}"
+        )
+
+    scored = []
+
+    for row in rows:
+        score = 0.0
+        used_null = False
+
+        for metric, weight in weights.items():
+            raw = row.get(metric)
+            if raw is None:
+                value = substitutes[metric]
+                used_null = True
+            else:
+                value = float(raw)
+
+            max_value = maximums[metric]
+            normalized = (value / max_value) if max_value > 0 else 0
+            score += normalized * weight * 100
+
+        scored.append({
+            "fid": str(row["fid"]),
+            "player_name": row.get("player_name") or "",
+            "draft_score": round(score, 3),
+            "used_null": used_null,
+        })
+
+    # Higher score = better draft rank.
+    # FID provides deterministic ordering if two scores are identical.
+    scored.sort(
+        key=lambda r: (-r["draft_score"], r["fid"])
+    )
+
+    print("\n" + "=" * 72)
+    print("SUNFIRE DRAFT RANKING")
+    print("=" * 72)
+
+    for rank, row in enumerate(scored, start=1):
+        db.patch_rank(
+            row["fid"],
+            row["draft_score"],
+            rank,
+        )
+        null_note = " *" if row["used_null"] else ""
+        print(
+            f"{rank:2}. {row['player_name'][:28]:28} "
+            f"{row['draft_score']:7.3f}{null_note}"
+        )
+
+    print("\n* = at least one NULL field used the 90%-of-lowest substitute")
+    print(f"Ranked {len(scored)} active Sunfire players.")
+
+
+
 def main():
     db = SupabaseREST(require_env("SUPABASE_URL"), require_env("SUPABASE_KEY"))
     wos = WOSClient(require_env("WOSORACLE_API_TOKEN"))
@@ -311,6 +448,9 @@ def main():
         if start + BATCH_SIZE < len(players):
             print(f"Saved batch; waiting {BATCH_DELAY:.0f}s...")
             time.sleep(BATCH_DELAY)
+
+    print("\nAPI refresh complete. Calculating draft rankings...")
+    calculate_draft_rankings(db)
 
     print("\n" + "=" * 60)
     print("SUNFIRE UPDATE COMPLETE")
