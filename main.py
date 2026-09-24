@@ -960,7 +960,6 @@ def make_database_row(
     standings_data,
     base_player,
 ):
-
     standings = extract_standings_data(standings_data)
 
     fid = str(
@@ -970,11 +969,13 @@ def make_database_row(
         )
     ).strip()
 
-    # Prefer profile power, then standings Personal Power, then roster power.
-    power = player.get("power")
+    # Personal Power:
+    # Prefer standings value because all of the other power categories
+    # are coming from the standings endpoint as well.
+    power = standings.get("personal_power")
 
     if power is None:
-        power = standings.get("personal_power")
+        power = player.get("power")
 
     if power is None:
         power = base_player.get("power")
@@ -984,42 +985,62 @@ def make_database_row(
         base_player["alliance"],
     )
 
-    # Preserve the roster alliance for this sync if the profile reports
-    # an alliance outside our target set. Case is intentionally preserved.
     if alliance not in TARGET_ALLIANCES:
         alliance = base_player["alliance"]
 
-    # Base fields are always safe to update.
     row = {
-        "fid": int(fid),
-        "player": player.get("name", base_player["name"]),
+        "fid": fid,
+        "player_name": player.get(
+            "name",
+            base_player["name"],
+        ),
+        "player": player.get(
+            "name",
+            base_player["name"],
+        ),
         "alliance": alliance,
-        "state": player.get("state", STATE_ID),
+        "state": player.get(
+            "state",
+            STATE_ID,
+        ),
         "furnace_level": player.get(
             "furnace_level",
             base_player["furnace_level"],
         ),
         "power": power,
         "kills": player.get("kills", 0) or 0,
-        "labyrinth_score": player.get("labyrinth_score", 0) or 0,
-        # A player discovered in one of our tracked State 2348 alliances
-        # is active for this sync. This also automatically reactivates a
-        # player who previously left the state and later returned.
+        "labyrinth_score": (
+            player.get("labyrinth_score", 0) or 0
+        ),
         "active": True,
         "api_updated": player.get("updated_at"),
     }
 
-    # Only include standings columns when the standings endpoint succeeded.
-    # If standings is unavailable (including HTTP 401), these keys are
-    # omitted so an upsert cannot replace existing values with NULL.
+    # Only update standings-derived columns when the
+    # standings request actually succeeded.
+    #
+    # This prevents a failed/401 standings request from
+    # wiping previously stored values.
     if standings_data is not None:
         row.update({
-            "pet_power": standings.get("pet_power"),
-            "island_prosperity": standings.get("island_prosperity"),
-            "hero_power": standings.get("hero_power"),
-            "hero_gear_power": standings.get("hero_gear_power"),
-            "expert_power": standings.get("expert_power"),
-            "standings_updated": standings.get("standings_updated"),
+            "pet_power": standings.get(
+                "pet_power"
+            ),
+            "island_prosperity": standings.get(
+                "island_prosperity"
+            ),
+            "hero_power": standings.get(
+                "hero_power"
+            ),
+            "hero_gear_power": standings.get(
+                "hero_gear_power"
+            ),
+            "expert_power": standings.get(
+                "expert_power"
+            ),
+            "standings_updated": standings.get(
+                "standings_updated"
+            ),
         })
 
     return row
