@@ -586,7 +586,7 @@ def find_target_alliances(alliances):
 # ============================================================
 
 def discover_players():
-
+    roster_scan_complete = True
     print()
     print(
         "========================================"
@@ -615,13 +615,14 @@ def discover_players():
             "Could not load state."
         )
 
-        return []
+        return None
 
 
-    alliances = state.get(
-        "alliances",
-        [],
-    )
+    alliances = state.get("alliances")
+
+    if not isinstance(alliances, list) or not alliances:
+        print("State response did not contain a valid alliance list.")
+        return None
 
 
     print(
@@ -724,6 +725,7 @@ def discover_players():
                 f"  {tag}"
             )
 
+        roster_scan_complete = False
         print()
 
 
@@ -732,7 +734,6 @@ def discover_players():
     # ========================================================
 
     player_map = {}
-
 
     # ========================================================
     # LOAD EACH ALLIANCE ROSTER
@@ -765,12 +766,11 @@ def discover_players():
 
 
         if not alliance_id:
-
             print(
-                f"{abbreviation} "
-                f"has no alliance ID."
+                f"{abbreviation} has no alliance ID. "
+                "Target roster is incomplete."
             )
-
+            roster_scan_complete = False
             continue
 
 
@@ -780,19 +780,22 @@ def discover_players():
 
 
         if not alliance:
-
             print(
-                f"Could not load "
-                f"{abbreviation}"
+                f"Could not load {abbreviation}. "
+                "Target roster is incomplete."
             )
-
+            roster_scan_complete = False
             continue
 
+        members = alliance.get("members")
 
-        members = alliance.get(
-            "members",
-            [],
-        )
+        if not isinstance(members, list):
+            print(
+                f"{abbreviation} returned an invalid member list. "
+                "Target roster is incomplete."
+            )
+            roster_scan_complete = False
+            continue
 
 
         print(
@@ -851,6 +854,14 @@ def discover_players():
 
         time.sleep(1)
 
+
+    if not roster_scan_complete:
+        print()
+        print(
+            "Target roster verification failed. "
+            "Skipping player sync and inactive cleanup."
+        )
+        return None
 
     players = list(
         player_map.values()
@@ -1378,6 +1389,110 @@ def get_tracked_database_players():
 
     return data
 
+# ============================================================
+# MARK PLAYERS WHO LEFT TRACKED ALLIANCES AS INACTIVE
+# ============================================================
+
+def mark_players_no_longer_in_target_alliances_inactive(
+    target_player_ids
+):
+    """
+    Mark players inactive when they are no longer in any of the
+    tracked alliances.
+
+    Players who switch between tracked alliances are updated by
+    the normal upsert and remain active.
+
+    None means the target roster was not verified, so cleanup
+    must be skipped.
+    """
+
+    if target_player_ids is None:
+        print(
+            "Target alliance cleanup skipped because "
+            "the roster was not verified."
+        )
+        return True, 0
+
+    existing_players = get_tracked_database_players()
+
+    if existing_players is None:
+        print(
+            "Target alliance cleanup skipped because "
+            "Supabase players could not be loaded."
+        )
+        return False, 0
+
+    departed_players = []
+
+    for player in existing_players:
+        fid = str(player.get("fid", "")).strip()
+
+        if not fid:
+            continue
+
+        # Still in a tracked alliance.
+        if fid in target_player_ids:
+            continue
+
+        # Already inactive; no need to update again.
+        if player.get("active") is False:
+            continue
+
+        departed_players.append(player)
+
+    print()
+    print("========================================")
+    print("    LEFT TRACKED ALLIANCES CHECK")
+    print("========================================")
+
+    if not departed_players:
+        print("No newly departed tracked-alliance players found.")
+        return True, 0
+
+    endpoint = f"{SUPABASE_URL}/rest/v1/players"
+    success = True
+    marked_count = 0
+
+    for player in departed_players:
+        fid = str(player["fid"]).strip()
+        name = player.get("player") or "Unknown"
+        alliance = player.get("alliance") or "???"
+
+        try:
+            response = requests.patch(
+                endpoint,
+                headers=SUPABASE_HEADERS,
+                params={"fid": f"eq.{fid}"},
+                json={"active": False},
+                timeout=30,
+            )
+
+        except requests.RequestException as error:
+            print(
+                f"FAILED | {name} | {fid} | {error}"
+            )
+            success = False
+            continue
+
+        if 200 <= response.status_code < 300:
+            marked_count += 1
+            print(
+                f"INACTIVE: {name} | {fid} "
+                f"| Former alliance {alliance}"
+            )
+        else:
+            print(
+                f"FAILED: {name} | {fid} "
+                f"| HTTP {response.status_code}"
+            )
+            print(response.text)
+            success = False
+
+    print(f"Players marked inactive: {marked_count}")
+
+    return success, marked_count
+
 
 def mark_players_no_longer_in_state_inactive(state_player_ids):
 
@@ -1857,13 +1972,14 @@ def main():
 
     players = discover_players()
 
-
-    if not players:
-
-        print(
-            "No players discovered."
+    if players is None:
+        raise SystemExit(
+            "Target roster could not be verified. "
+            "No database changes performed."
         )
 
+    if not players:
+        print("No players discovered.")
         raise SystemExit(1)
 
 
@@ -1880,36 +1996,54 @@ def main():
     )
 
 
+  
     # ========================================================
-    # MARK PLAYERS WHO LEFT STATE 2348 AS INACTIVE / GONE
+    # INACTIVE PLAYER CLEANUP
     # ========================================================
 
-    inactive_cleanup_success = True
+    target_cleanup_success = True
+    state_cleanup_success = True
+    players_marked_outside_alliances = 0
     players_marked_gone = 0
 
-    # Only run the cleanup after all target-player database writes
-    # succeeded. This prevents a partial/failed sync from changing
-    # player status.
-    if database_failures == 0:
+    if database_failures == 0 and not failed_profiles:
+
+        # ----------------------------------------------------
+        # CHECK TRACKED ALLIANCE MEMBERSHIP
+        # ----------------------------------------------------
+
+        target_player_ids = {
+            str(player["fid"]).strip()
+            for player in players
+            if player.get("fid")
+        }
+
+        (
+            target_cleanup_success,
+            players_marked_outside_alliances,
+        ) = mark_players_no_longer_in_target_alliances_inactive(
+            target_player_ids
+        )
+
+        # ----------------------------------------------------
+        # CHECK STATE MEMBERSHIP
+        # ----------------------------------------------------
 
         state_player_ids = discover_all_state_player_ids()
 
         (
-            inactive_cleanup_success,
+            state_cleanup_success,
             players_marked_gone,
-
         ) = mark_players_no_longer_in_state_inactive(
             state_player_ids
         )
 
     else:
-
         print()
         print(
             "Skipping inactive-player cleanup because "
-            "one or more database batches failed."
+            "a profile fetch or database batch failed."
         )
-
 
     # ========================================================
     # RUNTIME
@@ -1971,18 +2105,18 @@ def main():
         raise SystemExit(1)
 
 
-    if not inactive_cleanup_success:
-
+    if not target_cleanup_success or not state_cleanup_success:
         print()
         print(
-            "One or more inactive-player "
-            "database updates failed."
+            "One or more inactive-player database updates failed."
         )
-
         raise SystemExit(1)
 
-
     print()
+    print(
+        f"Players marked inactive after leaving tracked alliances: "
+        f"{players_marked_outside_alliances}"
+    )
     print(
         f"Players marked gone this run: "
         f"{players_marked_gone}"
